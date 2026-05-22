@@ -8,8 +8,8 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from scipy.sparse.linalg import svds
 from scipy.sparse import csr_matrix
+from rapidfuzz import process, fuzz
 
-# ── Paths ──────────────────────────────────────────────────────
 DATA_RAW = Path("data/raw")
 
 
@@ -26,7 +26,7 @@ def load_ratings(sample=True):
                 df = df.sample(n=min(2_000_000, len(df)), random_state=42)
             print(f"✓ Ratings loaded: {df.shape}")
             return df
-    raise FileNotFoundError("ratings.csv not found in data/raw/ml-25m/")
+    raise FileNotFoundError("ratings.csv not found")
 
 
 def load_movies():
@@ -36,7 +36,7 @@ def load_movies():
             df = pd.read_csv(path)
             print(f"✓ Movies loaded: {df.shape}")
             return df
-    raise FileNotFoundError("movies.csv not found in data/raw/ml-25m/")
+    raise FileNotFoundError("movies.csv not found")
 
 
 def extract_genres(genre_str):
@@ -57,7 +57,7 @@ def load_tmdb():
              'release_date', 'vote_average', 'vote_count',
              'original_language']].copy()
 
-    # ── load keywords if available ────────────────────────────
+    # keywords
     kw_path = DATA_RAW / "tmdb" / "keywords.csv"
     if kw_path.exists():
         kw = pd.read_csv(kw_path)
@@ -74,9 +74,9 @@ def load_tmdb():
         print("✓ Keywords merged")
     else:
         df['keyword_names'] = ''
-        print("⚠ keywords.csv not found — skipping")
+        print("⚠ keywords.csv not found")
 
-    # ── load credits if available ─────────────────────────────
+    # credits
     cr_path = DATA_RAW / "tmdb" / "credits.csv"
     if cr_path.exists():
         cr = pd.read_csv(cr_path)
@@ -111,7 +111,7 @@ def load_tmdb():
     else:
         df['cast_names']    = ''
         df['director_name'] = ''
-        print("⚠ credits.csv not found — skipping")
+        print("⚠ credits.csv not found")
 
     print(f"✓ TMDB loaded: {df.shape}")
     return df
@@ -126,61 +126,77 @@ def load_imdb():
 
 
 # ══════════════════════════════════════════════════════════════
-# 2. CONTENT-BASED FILTERING (TF-IDF)
+# 2. TITLE MATCHING
 # ══════════════════════════════════════════════════════════════
 
-# ── title aliases — maps what users type to TMDB title ────────
-TITLE_ALIASES = {
-    'frozen':         'frozen fever',
-    'batman':         'the dark knight',
-    'avengers':       'the avengers',
-    'lion king':      'the lion king',
-    'little mermaid': 'the little mermaid',
-    'jungle book':    'the jungle book',
-    'spiderman':      'spider-man',
-    'spider man':     'spider-man',
-}
-
-
-def resolve_title(title):
-    """Map common user-typed titles to their TMDB equivalents."""
-    return TITLE_ALIASES.get(title.lower().strip(), title)
-
-
 def detect_language(title):
-    """
-    Simple heuristic to detect non-English queries.
-    Returns language code or None.
-    """
     if any(ord(c) > 127 for c in title):
         return 'hi'
-
-    hindi_signals = [
-        'golmaal', 'dangal', 'dhoom', 'krrish', 'baahubali',
-        'sholay', 'dilwale', 'kabir', 'singham', 'dabangg',
-        'bajrangi', 'dil', 'pyaar', 'ishq', 'zindagi', 'muqabla',
-        'hrithik', 'salman', 'shahrukh', 'aamir', 'deepika',
-    ]
-    if any(h in title.lower() for h in hindi_signals):
-        return 'hi'
-
     return None
 
 
+def find_best_title_match(title, title_to_idx, threshold=60):
+    """
+    Fuzzy title matching — no hardcoded aliases.
+    Handles typos, missing words, punctuation, word order.
+    """
+    title_lower = title.lower().strip()
+    all_titles  = list(title_to_idx.index)
+
+    # 1. exact
+    if title_lower in title_to_idx:
+        return title_lower
+
+    # 2. normalised — strip punctuation and articles
+    def normalise(t):
+        t = re.sub(r'[^\w\s]', '', t.lower())
+        t = re.sub(r'\b(the|a|an)\b', '', t)
+        return re.sub(r'\s+', ' ', t).strip()
+
+    norm_query  = normalise(title_lower)
+    norm_map    = {normalise(t): t for t in all_titles}
+    if norm_query in norm_map:
+        return norm_map[norm_query]
+
+    # 3. token sort ratio — handles word order + missing words
+    match, score, _ = process.extractOne(
+        title_lower, all_titles,
+        scorer=fuzz.token_sort_ratio
+    )
+    if score >= threshold:
+        print(f"  → Fuzzy matched '{title}' → '{match}' ({score})")
+        return match
+
+    # 4. partial ratio — short query inside longer title
+    match, score, _ = process.extractOne(
+        title_lower, all_titles,
+        scorer=fuzz.partial_ratio
+    )
+    if score >= threshold + 10:
+        print(f"  → Partial matched '{title}' → '{match}' ({score})")
+        return match
+
+    print(f"  ✗ No match found for '{title}'")
+    return None
+
+
+# ══════════════════════════════════════════════════════════════
+# 3. CONTENT-BASED FILTERING (TF-IDF)
+# ══════════════════════════════════════════════════════════════
+
 def build_content_model(tmdb_df):
-    """
-    Richer soup = better recommendations.
-    genres x3 + keywords x2 + director x2 + cast + overview
-    """
     df = tmdb_df.copy().reset_index(drop=True)
     df['overview']      = df['overview'].fillna('')
     df['genre_names']   = df['genre_names'].fillna('')
     df['keyword_names'] = df['keyword_names'].fillna('') \
-                          if 'keyword_names' in df.columns else ''
+                          if 'keyword_names' in df.columns \
+                          else pd.Series([''] * len(df))
     df['cast_names']    = df['cast_names'].fillna('') \
-                          if 'cast_names' in df.columns else ''
+                          if 'cast_names' in df.columns \
+                          else pd.Series([''] * len(df))
     df['director_name'] = df['director_name'].fillna('') \
-                          if 'director_name' in df.columns else ''
+                          if 'director_name' in df.columns \
+                          else pd.Series([''] * len(df))
 
     df['soup'] = (
         df['genre_names']   + ' ' +
@@ -194,7 +210,6 @@ def build_content_model(tmdb_df):
         df['overview']
     )
 
-    # filter movies with almost no metadata
     df['soup_len'] = df['soup'].str.split().str.len()
     df = df[df['soup_len'] >= 10].reset_index(drop=True)
     print(f"  After filtering sparse movies: {len(df)} remaining")
@@ -209,7 +224,6 @@ def build_content_model(tmdb_df):
     print(f"✓ TF-IDF matrix shape: {tfidf_matrix.shape}")
 
     title_to_idx = pd.Series(df.index, index=df['title'].str.lower())
-
     return df, tfidf_matrix, tfidf, title_to_idx
 
 
@@ -217,34 +231,24 @@ def get_content_recommendations(title, tmdb_df, tfidf_matrix,
                                 title_to_idx, n=10,
                                 genre_filter=None,
                                 lang_filter=None):
-    # auto detect language if not specified
     if lang_filter is None:
         lang_filter = detect_language(title)
         if lang_filter:
             print(f"  → Language detected: {lang_filter}")
 
-    title       = resolve_title(title)
-    title_lower = title.lower().strip()
+    matched = find_best_title_match(title, title_to_idx)
+    if matched is None:
+        return []
 
-    if title_lower not in title_to_idx:
-        # try partial match
-        matches = [t for t in title_to_idx.index
-                   if t.startswith(title_lower)]
-        if not matches:
-            print(f"  ✗ '{title}' not found.")
-            return []
-        title_lower = min(matches, key=len)
-        print(f"  → Matched to: '{title_lower}'")
-
-    idx        = int(title_to_idx[title_lower])
+    idx        = int(title_to_idx[matched])
     movie_vec  = tfidf_matrix[idx]
     sim_scores = cosine_similarity(movie_vec, tfidf_matrix).flatten()
 
-    # ── popularity boost ──────────────────────────────────────
+    # popularity boost
     max_votes = tmdb_df['vote_count'].fillna(0).max()
     if max_votes > 0:
-        pop_bonus  = (tmdb_df['vote_count'].fillna(0) / max_votes
-                      ).values * 0.35
+        pop_bonus  = (tmdb_df['vote_count'].fillna(0)
+                      / max_votes).values * 0.35
         sim_scores = sim_scores * 0.65 + pop_bonus
 
     sim_indices = np.argsort(sim_scores)[::-1][1:n * 4 + 1]
@@ -254,14 +258,15 @@ def get_content_recommendations(title, tmdb_df, tfidf_matrix,
         if len(results) >= n:
             break
         try:
-            score = float(sim_scores[i])
+            score  = float(sim_scores[i])
             if score < 0.10:
                 continue
             row    = tmdb_df.iloc[int(i)]
             lang   = str(row.get('original_language', 'en'))
             genres = str(row['genre_names'])
-            votes = int(row.get('vote_count', 0) or 0)
-            if votes < 100:          # skip virtually unknown movies
+            votes  = int(row.get('vote_count', 0) or 0)
+
+            if votes < 100:
                 continue
             if lang_filter and lang != lang_filter:
                 continue
@@ -273,7 +278,7 @@ def get_content_recommendations(title, tmdb_df, tfidf_matrix,
                 'title':             row['title'],
                 'genre_names':       genres,
                 'similarity_score':  round(score, 4),
-                'vote_count':        int(row.get('vote_count', 0) or 0),
+                'vote_count':        votes,
                 'original_language': lang
             })
         except IndexError:
@@ -283,7 +288,7 @@ def get_content_recommendations(title, tmdb_df, tfidf_matrix,
 
 
 # ══════════════════════════════════════════════════════════════
-# 3. COLLABORATIVE FILTERING
+# 4. COLLABORATIVE FILTERING
 # ══════════════════════════════════════════════════════════════
 
 def build_collab_model(ratings_df,
@@ -293,20 +298,18 @@ def build_collab_model(ratings_df,
 
     movie_counts   = ratings_df['movieId'].value_counts()
     popular_movies = movie_counts[
-        movie_counts >= min_movie_ratings
-    ].index
+        movie_counts >= min_movie_ratings].index
     df = ratings_df[ratings_df['movieId'].isin(popular_movies)]
 
     user_counts  = df['userId'].value_counts()
     active_users = user_counts[
-        user_counts >= min_user_ratings
-    ].index
+        user_counts >= min_user_ratings].index
     df = df[df['userId'].isin(active_users)]
 
     print(f"  After filtering: {df['userId'].nunique()} users, "
           f"{df['movieId'].nunique()} movies")
 
-    print("  Building user-movie matrix (this takes ~30 seconds)...")
+    print("  Building user-movie matrix (~30 seconds)...")
     user_movie_matrix = df.pivot_table(
         index='userId', columns='movieId', values='rating'
     ).fillna(0)
@@ -321,9 +324,10 @@ def get_collab_recommendations(user_id, user_movie_matrix,
         print(f"  ✗ User {user_id} not found.")
         return []
 
-    user_vec    = user_movie_matrix.loc[user_id].values.reshape(1, -1)
-    all_vecs    = user_movie_matrix.values
-    sim_scores  = cosine_similarity(user_vec, all_vecs).flatten()
+    user_vec   = user_movie_matrix.loc[user_id].values.reshape(1, -1)
+    sim_scores = cosine_similarity(
+        user_vec, user_movie_matrix.values
+    ).flatten()
 
     sim_indices   = np.argsort(sim_scores)[::-1][1:21]
     similar_users = user_movie_matrix.index[sim_indices].tolist()
@@ -334,34 +338,31 @@ def get_collab_recommendations(user_id, user_movie_matrix,
 
     candidate_scores = {}
     for sim_user in similar_users:
-        sim_user_ratings = ratings_df[
+        sim_ratings = ratings_df[
             (ratings_df['userId'] == sim_user) &
             (ratings_df['rating'] >= 4.0) &
             (~ratings_df['movieId'].isin(seen_movies))
         ]
-        for _, row in sim_user_ratings.iterrows():
+        for _, row in sim_ratings.iterrows():
             mid = row['movieId']
             candidate_scores[mid] = (candidate_scores.get(mid, 0)
                                      + row['rating'])
 
     top_movies = sorted(candidate_scores.items(),
                         key=lambda x: x[1], reverse=True)[:n]
-
     return [{'movieId': mid, 'score': round(score, 2)}
             for mid, score in top_movies]
 
 
 # ══════════════════════════════════════════════════════════════
-# 4. SVD MATRIX FACTORIZATION
+# 5. SVD MATRIX FACTORIZATION
 # ══════════════════════════════════════════════════════════════
 
 def build_svd_model(ratings_df, n_factors=20):
     print("\nBuilding SVD model...")
 
-    top_movies = (ratings_df['movieId']
-                  .value_counts().head(500).index)
-    top_users  = (ratings_df['userId']
-                  .value_counts().head(2000).index)
+    top_movies = ratings_df['movieId'].value_counts().head(500).index
+    top_users  = ratings_df['userId'].value_counts().head(2000).index
 
     filtered = ratings_df[
         ratings_df['movieId'].isin(top_movies) &
@@ -377,17 +378,14 @@ def build_svd_model(ratings_df, n_factors=20):
 
     user_ids  = list(user_movie.index)
     movie_ids = list(user_movie.columns)
-
     print(f"  Matrix shape: {user_movie.shape}")
 
     mat = csr_matrix(user_movie.values, dtype=np.float32)
     k   = min(n_factors, min(mat.shape) - 1)
-
     print(f"  Running SVD with {k} factors...")
-    U, sigma, Vt  = svds(mat, k=k)
-    sigma_diag    = np.diag(sigma)
-    predicted_mat = np.dot(np.dot(U, sigma_diag), Vt)
 
+    U, sigma, Vt  = svds(mat, k=k)
+    predicted_mat = np.dot(np.dot(U, np.diag(sigma)), Vt)
     print("✓ SVD complete!")
 
     svd_data = {
@@ -395,10 +393,9 @@ def build_svd_model(ratings_df, n_factors=20):
         'user_ids':         user_ids,
         'movie_ids':        movie_ids
     }
-
     with open("models/svd_model.pkl", "wb") as f:
         pickle.dump(svd_data, f)
-    print("✓ SVD model saved to models/svd_model.pkl")
+    print("✓ SVD model saved")
 
     return svd_data
 
@@ -413,19 +410,16 @@ def get_svd_recommendations(user_id, svd_data, ratings_df,
         print(f"  ✗ User {user_id} not in SVD model.")
         return []
 
-    user_idx   = user_ids.index(user_id)
-    user_preds = pred_mat[user_idx]
-
+    user_preds  = pred_mat[user_ids.index(user_id)]
     seen_movies = set(
         ratings_df[ratings_df['userId'] == user_id]['movieId']
     )
 
-    candidates = []
-    for movie_idx, pred_rating in enumerate(user_preds):
-        movie_id = movie_ids[movie_idx]
-        if movie_id not in seen_movies:
-            candidates.append((movie_id, pred_rating))
-
+    candidates = [
+        (movie_ids[i], pred_rating)
+        for i, pred_rating in enumerate(user_preds)
+        if movie_ids[i] not in seen_movies
+    ]
     candidates.sort(key=lambda x: x[1], reverse=True)
 
     results = []
@@ -433,18 +427,16 @@ def get_svd_recommendations(user_id, svd_data, ratings_df,
         title = movies_df[
             movies_df['movieId'] == movie_id
         ]['title'].values
-        title = title[0] if len(title) > 0 else "Unknown"
         results.append({
             'movieId':          movie_id,
-            'title':            title,
+            'title':            title[0] if len(title) > 0 else "Unknown",
             'predicted_rating': round(float(pred_rating), 3)
         })
-
     return results
 
 
 # ══════════════════════════════════════════════════════════════
-# 5. WEIGHTED ENSEMBLE
+# 6. WEIGHTED ENSEMBLE
 # ══════════════════════════════════════════════════════════════
 
 def normalize_scores(recs, score_key):
@@ -456,8 +448,7 @@ def normalize_scores(recs, score_key):
     rng    = max_s - min_s if max_s != min_s else 1.0
     for r in recs:
         r['normalized_score'] = round(
-            (r[score_key] - min_s) / rng, 4
-        )
+            (r[score_key] - min_s) / rng, 4)
     return recs
 
 
@@ -466,40 +457,32 @@ def hybrid_recommend(user_id, user_movie_matrix, ratings_df,
                      title_to_idx, svd_data,
                      alpha=0.4, beta=0.3, gamma=0.3, n=10):
     print(f"\nGenerating hybrid recommendations for user {user_id}...")
-    print(f"  Weights — Collaborative: {alpha} | "
-          f"Content: {beta} | SVD: {gamma}")
 
     collab_recs = get_collab_recommendations(
-        user_id, user_movie_matrix, ratings_df, n=50
-    )
-    svd_recs = get_svd_recommendations(
-        user_id, svd_data, ratings_df, movies_df, n=50
-    )
+        user_id, user_movie_matrix, ratings_df, n=50)
+    svd_recs    = get_svd_recommendations(
+        user_id, svd_data, ratings_df, movies_df, n=50)
 
-    user_top_movies = (
+    # seed content filter from user's top 3 rated movies
+    user_top = (
         ratings_df[ratings_df['userId'] == user_id]
         .sort_values('rating', ascending=False)
         .head(3)['movieId'].tolist()
     )
 
     content_recs = []
-    for movie_id in user_top_movies:
-        title_row = movies_df[
-            movies_df['movieId'] == movie_id
-        ]['title']
+    for movie_id in user_top:
+        title_row = movies_df[movies_df['movieId'] == movie_id]['title']
         if len(title_row) == 0:
             continue
-        title       = title_row.values[0]
-        title_clean = re.sub(r'\s*\(\d{4}\)\s*$', '', title).strip()
-
-        if ', The' in title_clean:
-            title_clean = 'The ' + title_clean.replace(', The', '')
-        if ', A ' in title_clean:
-            title_clean = 'A ' + title_clean.replace(', A ', ' ')
-
+        title = title_row.values[0]
+        title = re.sub(r'\s*\(\d{4}\)\s*$', '', title).strip()
+        if ', The' in title:
+            title = 'The ' + title.replace(', The', '')
+        if ', A ' in title:
+            title = 'A ' + title.replace(', A ', ' ')
         recs = get_content_recommendations(
-            title_clean, tmdb_df, tfidf_matrix, title_to_idx, n=20
-        )
+            title, tmdb_df, tfidf_matrix, title_to_idx, n=20)
         content_recs.extend(recs)
 
     collab_recs  = normalize_scores(collab_recs,  'score')
@@ -509,14 +492,13 @@ def hybrid_recommend(user_id, user_movie_matrix, ratings_df,
     combined = {}
 
     for r in collab_recs:
-        title = movies_df[
+        t = movies_df[
             movies_df['movieId'] == r['movieId']
         ]['title'].values
-        if len(title) == 0:
+        if len(t) == 0:
             continue
-        title = title[0]
-        combined[title] = (combined.get(title, 0)
-                           + alpha * r['normalized_score'])
+        combined[t[0]] = (combined.get(t[0], 0)
+                          + alpha * r['normalized_score'])
 
     for r in svd_recs:
         combined[r['title']] = (combined.get(r['title'], 0)
@@ -526,110 +508,39 @@ def hybrid_recommend(user_id, user_movie_matrix, ratings_df,
         combined[r['title']] = (combined.get(r['title'], 0)
                                 + beta * r['normalized_score'])
 
-    seen_titles = set()
-    seen_ids    = ratings_df[
+    # remove seen movies
+    seen_ids = ratings_df[
         ratings_df['userId'] == user_id
     ]['movieId'].tolist()
-
     for mid in seen_ids:
         t = movies_df[movies_df['movieId'] == mid]['title'].values
         if len(t) > 0:
-            seen_titles.add(t[0])
-
-    for title in seen_titles:
-        combined.pop(title, None)
+            combined.pop(t[0], None)
 
     ranked = sorted(combined.items(),
                     key=lambda x: x[1], reverse=True)
-
-    return [{'title': title, 'hybrid_score': round(score, 4)}
-            for title, score in ranked[:n]]
+    return [{'title': t, 'hybrid_score': round(s, 4)}
+            for t, s in ranked[:n]]
 
 
 # ══════════════════════════════════════════════════════════════
-# MAIN — test everything
+# MAIN
 # ══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    print("=" * 50)
-    print("PHASE 2 — Loading datasets")
-    print("=" * 50)
-
     ratings = load_ratings(sample=True)
     movies  = load_movies()
     tmdb    = load_tmdb()
     imdb    = load_imdb()
 
-    print("\n" + "=" * 50)
-    print("PHASE 2 — Content-Based Recommender")
-    print("=" * 50)
-
     tmdb_clean, tfidf_matrix, tfidf, title_to_idx = \
         build_content_model(tmdb)
 
-    for test_movie in ["Inception", "Toy Story", "The Dark Knight"]:
-        print(f"\n--- Similar to '{test_movie}' ---")
+    for test in ["Inception", "Moana", "Golmaal",
+                 "Pirates of Caribbean", "Toy Story"]:
+        print(f"\n--- Similar to '{test}' ---")
         recs = get_content_recommendations(
-            test_movie, tmdb_clean, tfidf_matrix, title_to_idx, n=5
-        )
+            test, tmdb_clean, tfidf_matrix, title_to_idx, n=5)
         for i, r in enumerate(recs, 1):
             print(f"  {i}. {r['title']:<40} "
-                  f"| {r['genre_names']:<30} "
                   f"| score: {r['similarity_score']}")
-
-    print("\n" + "=" * 50)
-    print("PHASE 2 — Collaborative Filtering")
-    print("=" * 50)
-
-    user_movie_matrix, ratings_filtered = build_collab_model(ratings)
-    test_user = int(ratings_filtered['userId'].iloc[0])
-    print(f"\nRecommendations for user {test_user}:")
-
-    collab_recs = get_collab_recommendations(
-        test_user, user_movie_matrix, ratings_filtered, n=10
-    )
-    for i, r in enumerate(collab_recs, 1):
-        title = movies[
-            movies['movieId'] == r['movieId']
-        ]['title'].values
-        title = title[0] if len(title) > 0 else "Unknown"
-        print(f"  {i}. {title:<45} | score: {r['score']}")
-
-    print("\n" + "=" * 50)
-    print("PHASE 2 — SVD Recommender")
-    print("=" * 50)
-
-    svd_data      = build_svd_model(ratings, n_factors=50)
-    test_user_svd = svd_data['user_ids'][0]
-    print(f"\nSVD Recommendations for user {test_user_svd}:")
-
-    svd_recs = get_svd_recommendations(
-        test_user_svd, svd_data, ratings, movies, n=10
-    )
-    for i, r in enumerate(svd_recs, 1):
-        print(f"  {i}. {r['title']:<45} "
-              f"| predicted rating: {r['predicted_rating']}")
-
-    print("\n" + "=" * 50)
-    print("PHASE 3 — Hybrid Ensemble")
-    print("=" * 50)
-
-    ensemble_user = svd_data['user_ids'][0]
-    hybrid_recs   = hybrid_recommend(
-        user_id           = ensemble_user,
-        user_movie_matrix = user_movie_matrix,
-        ratings_df        = ratings_filtered,
-        movies_df         = movies,
-        tmdb_df           = tmdb_clean,
-        tfidf_matrix      = tfidf_matrix,
-        title_to_idx      = title_to_idx,
-        svd_data          = svd_data,
-        alpha=0.4, beta=0.3, gamma=0.3,
-        n=10
-    )
-
-    print(f"\nTop 10 Hybrid Recommendations for user {ensemble_user}:")
-    print(f"{'Rank':<5} {'Title':<45} {'Hybrid Score'}")
-    print("-" * 65)
-    for i, r in enumerate(hybrid_recs, 1):
-        print(f"  {i:<4} {r['title']:<45} {r['hybrid_score']}")

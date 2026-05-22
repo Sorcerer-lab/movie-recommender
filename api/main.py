@@ -226,3 +226,15 @@ def user_profile(user_id: int):
         "decade_counts": decade_counts,
         "top_rated":     top_rated
     }
+@app.get("/search-title")
+def search_title(q: str):
+    from rapidfuzz import process, fuzz
+    matches = process.extract(
+        q.lower(), list(title_to_idx.index),
+        scorer=fuzz.token_sort_ratio, limit=5
+    )
+    return {
+        "query":   q,
+        "matches": [{"title": m, "score": s}
+                    for m, s, _ in matches]
+    }
