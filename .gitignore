@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+venv/
+.env/
+
+# Large datasets
+data/
+
+# Models
+models/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
