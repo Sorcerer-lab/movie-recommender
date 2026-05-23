@@ -44,7 +44,7 @@ movies   = load_movies()
 tmdb     = load_tmdb()
 imdb     = load_imdb()
 
-tmdb_clean, tfidf_matrix, tfidf, title_to_idx = build_content_model(tmdb)
+tmdb_clean, tfidf_matrix, tfidf, id_to_idx, search_df = build_content_model(tmdb)
 user_movie_matrix, ratings_filtered            = build_collab_model(ratings)
 svd_data                                       = build_svd_model(ratings)
 vader_analyzer                                 = build_vader()
@@ -108,10 +108,11 @@ def recommend(user_id: int, n: int = 10,
             movies_df         = movies,
             tmdb_df           = tmdb_clean,
             tfidf_matrix      = tfidf_matrix,
-            title_to_idx      = title_to_idx,
+            id_to_idx         = id_to_idx,
+            search_df         = search_df,
             svd_data          = svd_data,
             alpha=0.4, beta=0.3, gamma=0.3,
-            n=n * 2   # get extra candidates for re-ranking
+            n=n * 2
         )
 
         if not hybrid_recs:
@@ -147,26 +148,20 @@ def similar(title: str, n: int = 10,
     try:
         recs = get_content_recommendations(
             title, tmdb_clean, tfidf_matrix,
-            title_to_idx, n=n,
+            id_to_idx, search_df, n=n,
             genre_filter=genre,
             lang_filter=lang
         )
-
         if not recs:
             raise HTTPException(
                 status_code=404,
-                detail=f"No results for '{title}'. "
-                       f"Check spelling or try a different genre."
+                detail=f"No results for '{title}'."
             )
-
         return {
             "query_title": title,
             "count":       len(recs),
-            "genre_filter": genre,
-            "lang_filter":  lang,
             "similar":     recs
         }
-
     except HTTPException:
         raise
     except Exception as e:

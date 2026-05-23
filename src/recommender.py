@@ -126,7 +126,7 @@ def load_imdb():
 
 
 # ══════════════════════════════════════════════════════════════
-# 2. TITLE MATCHING
+# 2. TITLE MATCHING — ID based, no duplicate issues
 # ══════════════════════════════════════════════════════════════
 
 def detect_language(title):
@@ -135,46 +135,69 @@ def detect_language(title):
     return None
 
 
-def find_best_title_match(title, title_to_idx, threshold=60):
+def find_best_title_match(title, search_df, threshold=60):
     """
-    Fuzzy title matching — no hardcoded aliases.
-    Handles typos, missing words, punctuation, word order.
+    Returns TMDB movie ID (not title string).
+    Uses search_df which has one row per movie with
+    id, title, release_date, genre_names, title_lower.
+
+    When multiple movies share a title, picks the one
+    with the highest vote_count (most popular / well-known).
+    No user input prompts — fully automatic.
     """
     title_lower = title.lower().strip()
-    all_titles  = list(title_to_idx.index)
 
-    # 1. exact
-    if title_lower in title_to_idx:
-        return title_lower
+    # ── 1. exact match ────────────────────────────────────────
+    exact = search_df[search_df['title_lower'] == title_lower]
+    if len(exact) == 1:
+        return int(exact.iloc[0]['id'])
+    if len(exact) > 1:
+        # pick most popular among duplicates
+        best = exact.loc[exact['vote_count'].idxmax()]
+        print(f"  → Multiple exact matches for '{title}', "
+              f"picked most popular: '{best['title']}' "
+              f"({str(best['release_date'])[:4]})")
+        return int(best['id'])
 
-    # 2. normalised — strip punctuation and articles
+    # ── 2. normalised match ───────────────────────────────────
     def normalise(t):
         t = re.sub(r'[^\w\s]', '', t.lower())
         t = re.sub(r'\b(the|a|an)\b', '', t)
         return re.sub(r'\s+', ' ', t).strip()
 
-    norm_query  = normalise(title_lower)
-    norm_map    = {normalise(t): t for t in all_titles}
-    if norm_query in norm_map:
-        return norm_map[norm_query]
+    norm_query = normalise(title_lower)
+    search_df  = search_df.copy()
+    search_df['title_norm'] = search_df['title_lower'].apply(normalise)
+    norm_match = search_df[search_df['title_norm'] == norm_query]
+    if len(norm_match) >= 1:
+        best = norm_match.loc[norm_match['vote_count'].idxmax()]
+        print(f"  → Normalised match: '{best['title']}'")
+        return int(best['id'])
 
-    # 3. token sort ratio — handles word order + missing words
+    # ── 3. fuzzy token sort ───────────────────────────────────
+    all_titles  = search_df['title_lower'].tolist()
     match, score, _ = process.extractOne(
         title_lower, all_titles,
         scorer=fuzz.token_sort_ratio
     )
     if score >= threshold:
-        print(f"  → Fuzzy matched '{title}' → '{match}' ({score})")
-        return match
+        matched_rows = search_df[search_df['title_lower'] == match]
+        best = matched_rows.loc[matched_rows['vote_count'].idxmax()]
+        print(f"  → Fuzzy matched '{title}' → "
+              f"'{best['title']}' (score:{score})")
+        return int(best['id'])
 
-    # 4. partial ratio — short query inside longer title
+    # ── 4. partial ratio ──────────────────────────────────────
     match, score, _ = process.extractOne(
         title_lower, all_titles,
         scorer=fuzz.partial_ratio
     )
     if score >= threshold + 10:
-        print(f"  → Partial matched '{title}' → '{match}' ({score})")
-        return match
+        matched_rows = search_df[search_df['title_lower'] == match]
+        best = matched_rows.loc[matched_rows['vote_count'].idxmax()]
+        print(f"  → Partial matched '{title}' → "
+              f"'{best['title']}' (score:{score})")
+        return int(best['id'])
 
     print(f"  ✗ No match found for '{title}'")
     return None
@@ -185,6 +208,14 @@ def find_best_title_match(title, title_to_idx, threshold=60):
 # ══════════════════════════════════════════════════════════════
 
 def build_content_model(tmdb_df):
+    """
+    Returns:
+        df          — cleaned TMDB dataframe
+        tfidf_matrix
+        tfidf       — fitted vectorizer
+        id_to_idx   — TMDB movie id → dataframe row index
+        search_df   — lightweight search table for fuzzy matching
+    """
     df = tmdb_df.copy().reset_index(drop=True)
     df['overview']      = df['overview'].fillna('')
     df['genre_names']   = df['genre_names'].fillna('')
@@ -197,6 +228,9 @@ def build_content_model(tmdb_df):
     df['director_name'] = df['director_name'].fillna('') \
                           if 'director_name' in df.columns \
                           else pd.Series([''] * len(df))
+    df['vote_count']    = pd.to_numeric(
+        df['vote_count'], errors='coerce'
+    ).fillna(0)
 
     df['soup'] = (
         df['genre_names']   + ' ' +
@@ -223,24 +257,40 @@ def build_content_model(tmdb_df):
     tfidf_matrix = tfidf.fit_transform(df['soup'])
     print(f"✓ TF-IDF matrix shape: {tfidf_matrix.shape}")
 
-    title_to_idx = pd.Series(df.index, index=df['title'].str.lower())
-    return df, tfidf_matrix, tfidf, title_to_idx
+    # ── ID based index — no duplicate title issues ─────────────
+    id_to_idx = pd.Series(df.index, index=df['id'])
+
+    # ── search table for fuzzy matching ───────────────────────
+    search_df = df[['id', 'title', 'release_date',
+                    'genre_names', 'vote_count']].copy()
+    search_df['title_lower'] = (
+        search_df['title'].fillna('').str.lower().str.strip()
+    )
+
+    return df, tfidf_matrix, tfidf, id_to_idx, search_df
 
 
 def get_content_recommendations(title, tmdb_df, tfidf_matrix,
-                                title_to_idx, n=10,
+                                id_to_idx, search_df, n=10,
                                 genre_filter=None,
                                 lang_filter=None):
+    # auto detect language
     if lang_filter is None:
         lang_filter = detect_language(title)
         if lang_filter:
             print(f"  → Language detected: {lang_filter}")
 
-    matched = find_best_title_match(title, title_to_idx)
-    if matched is None:
+    # get TMDB movie ID via fuzzy match
+    matched_id = find_best_title_match(title, search_df)
+    if matched_id is None:
         return []
 
-    idx        = int(title_to_idx[matched])
+    # get dataframe index from ID
+    if matched_id not in id_to_idx:
+        print(f"  ✗ Movie ID {matched_id} not in index.")
+        return []
+
+    idx        = int(id_to_idx[matched_id])
     movie_vec  = tfidf_matrix[idx]
     sim_scores = cosine_similarity(movie_vec, tfidf_matrix).flatten()
 
@@ -396,7 +446,6 @@ def build_svd_model(ratings_df, n_factors=20):
     with open("models/svd_model.pkl", "wb") as f:
         pickle.dump(svd_data, f)
     print("✓ SVD model saved")
-
     return svd_data
 
 
@@ -454,7 +503,7 @@ def normalize_scores(recs, score_key):
 
 def hybrid_recommend(user_id, user_movie_matrix, ratings_df,
                      movies_df, tmdb_df, tfidf_matrix,
-                     title_to_idx, svd_data,
+                     id_to_idx, search_df, svd_data,
                      alpha=0.4, beta=0.3, gamma=0.3, n=10):
     print(f"\nGenerating hybrid recommendations for user {user_id}...")
 
@@ -463,7 +512,6 @@ def hybrid_recommend(user_id, user_movie_matrix, ratings_df,
     svd_recs    = get_svd_recommendations(
         user_id, svd_data, ratings_df, movies_df, n=50)
 
-    # seed content filter from user's top 3 rated movies
     user_top = (
         ratings_df[ratings_df['userId'] == user_id]
         .sort_values('rating', ascending=False)
@@ -482,7 +530,9 @@ def hybrid_recommend(user_id, user_movie_matrix, ratings_df,
         if ', A ' in title:
             title = 'A ' + title.replace(', A ', ' ')
         recs = get_content_recommendations(
-            title, tmdb_df, tfidf_matrix, title_to_idx, n=20)
+            title, tmdb_df, tfidf_matrix,
+            id_to_idx, search_df, n=20
+        )
         content_recs.extend(recs)
 
     collab_recs  = normalize_scores(collab_recs,  'score')
@@ -508,7 +558,6 @@ def hybrid_recommend(user_id, user_movie_matrix, ratings_df,
         combined[r['title']] = (combined.get(r['title'], 0)
                                 + beta * r['normalized_score'])
 
-    # remove seen movies
     seen_ids = ratings_df[
         ratings_df['userId'] == user_id
     ]['movieId'].tolist()
@@ -533,14 +582,16 @@ if __name__ == "__main__":
     tmdb    = load_tmdb()
     imdb    = load_imdb()
 
-    tmdb_clean, tfidf_matrix, tfidf, title_to_idx = \
+    tmdb_clean, tfidf_matrix, tfidf, id_to_idx, search_df = \
         build_content_model(tmdb)
 
     for test in ["Inception", "Moana", "Golmaal",
-                 "Pirates of Caribbean", "Toy Story"]:
+                 "Pirates of Caribbean", "Toy Story", "Batman"]:
         print(f"\n--- Similar to '{test}' ---")
         recs = get_content_recommendations(
-            test, tmdb_clean, tfidf_matrix, title_to_idx, n=5)
+            test, tmdb_clean, tfidf_matrix,
+            id_to_idx, search_df, n=5
+        )
         for i, r in enumerate(recs, 1):
             print(f"  {i}. {r['title']:<40} "
                   f"| score: {r['similarity_score']}")
