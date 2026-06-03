@@ -1,26 +1,29 @@
+import pickle
+import json
+import sys
+import re
+import scipy.sparse
+from pathlib import Path
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
 import numpy as np
-import pickle
-import sys
-import re
-from src.explainer import explain_recommendations
-from pathlib import Path
 
-# add src to path so we can import our modules
 sys.path.append(str(Path(__file__).parent.parent))
 
 from src.recommender import (
     load_ratings, load_movies, load_tmdb,
     build_content_model, build_collab_model,
     build_svd_model, hybrid_recommend,
-    get_content_recommendations
+    get_content_recommendations,
+    build_clustered_collab_model
 )
 from src.sentiment import (
     load_imdb, build_vader, load_distilbert,
     rerank_with_sentiment, distilbert_score
 )
+from src.explainer import explain_recommendations
 
 # ── initialise app ─────────────────────────────────────────────
 app = FastAPI(
@@ -37,19 +40,62 @@ app.add_middleware(
 )
 
 # ── global state — loaded once at startup ──────────────────────
-print("Loading all models and data...")
+
+print("Loading models and data...")
 
 ratings  = load_ratings(sample=True)
 movies   = load_movies()
-tmdb     = load_tmdb()
 imdb     = load_imdb()
 
-tmdb_clean, tfidf_matrix, tfidf, id_to_idx, search_df = build_content_model(tmdb)
-user_movie_matrix, ratings_filtered            = build_collab_model(ratings)
-svd_data                                       = build_svd_model(ratings)
-vader_analyzer                                 = build_vader()
+# ── load pre-trained TF-IDF if available ──────────────────────
+tmdb_pkl = Path("models/tmdb_clean.pkl")
+if tmdb_pkl.exists():
+    print("  Loading pre-trained TF-IDF from disk...")
+    tmdb_clean   = pd.read_pickle("models/tmdb_clean.pkl")
+    tfidf_matrix = scipy.sparse.load_npz(
+        "models/tfidf_matrix.npz"
+    )
+    with open("models/tfidf_vectorizer.pkl", "rb") as f:
+        tfidf = pickle.load(f)
 
-# load fine-tuned DistilBERT
+    # rebuild id_to_idx and search_df
+    id_to_idx = pd.Series(
+        tmdb_clean.index, index=tmdb_clean['id']
+    )
+    search_df = tmdb_clean[
+        ['id', 'title', 'release_date',
+         'genre_names', 'vote_count']
+    ].copy()
+    search_df['title_lower'] = (
+        search_df['title']
+        .fillna('').str.lower().str.strip()
+    )
+    print("✓ Pre-trained TF-IDF loaded")
+else:
+    print("  Building TF-IDF from scratch...")
+    tmdb = load_tmdb()
+    tmdb_clean, tfidf_matrix, tfidf, id_to_idx, search_df = \
+        build_content_model(tmdb)
+    print("✓ TF-IDF built")
+
+# ── load pre-trained SVD if available ─────────────────────────
+svd_pkl = Path("models/svd_model.pkl")
+if svd_pkl.exists():
+    with open(svd_pkl, "rb") as f:
+        svd_data = pickle.load(f)
+    print("✓ Pre-trained SVD loaded")
+else:
+    svd_data = build_svd_model(ratings)
+    print("✓ SVD built")
+
+# ── collaborative filter — always build fresh ─────────────────
+# ── collaborative filter + clusters ───────────────────────────
+from src.recommender import build_clustered_collab_model
+user_movie_matrix, ratings_filtered = build_collab_model(ratings)
+cluster_data = build_clustered_collab_model(ratings)
+vader_analyzer = build_vader()
+
+# ── load DistilBERT ───────────────────────────────────────────
 try:
     db_model, db_tokenizer = load_distilbert()
     USE_DISTILBERT = True
@@ -57,9 +103,20 @@ try:
 except Exception as e:
     print(f"⚠ DistilBERT not available ({e}), using VADER only")
     USE_DISTILBERT = False
+    # ── load optimal weights ──────────────────────────────────────
+weights_path = Path("models/optimal_weights.json")
+if weights_path.exists():
+    with open(weights_path) as f:
+        w = json.load(f)
+    ALPHA = w['alpha']
+    BETA  = w['beta']
+    GAMMA = w['gamma']
+    print(f"✓ Optimal weights: α={ALPHA} β={BETA} γ={GAMMA}")
+else:
+    ALPHA, BETA, GAMMA = 0.4, 0.3, 0.3
+    print("⚠ Using default weights α=0.4 β=0.3 γ=0.3")
 
 print("✓ All models ready — API is live!")
-
 
 # ══════════════════════════════════════════════════════════════
 # HELPER
@@ -111,7 +168,7 @@ def recommend(user_id: int, n: int = 10,
             id_to_idx         = id_to_idx,
             search_df         = search_df,
             svd_data          = svd_data,
-            alpha=0.4, beta=0.3, gamma=0.3,
+            alpha=ALPHA, beta=BETA, gamma=GAMMA,
             n=n * 2
         )
 
@@ -123,9 +180,19 @@ def recommend(user_id: int, n: int = 10,
 
         # re-rank with sentiment
         reranked = rerank_with_sentiment(
-            hybrid_recs, vader_analyzer,
-            sentiment_weight=sentiment_weight
+            hybrid_recs,
+            vader_analyzer,
+            tmdb_df          = tmdb_clean,
+            sentiment_weight = sentiment_weight
         )[:n]
+        for r in reranked:
+            s = r.get('sentiment_score', 0.5)
+            r['audience_label'] = (
+                "Highly rated"    if s > 0.70 else
+                "Well rated"      if s > 0.50 else
+                "Mixed reception" if s > 0.30 else
+                "Limited ratings"
+            )
         explained = explain_recommendations(
             reranked, ratings, movies, user_id
         )
@@ -225,7 +292,7 @@ def user_profile(user_id: int):
 def search_title(q: str):
     from rapidfuzz import process, fuzz
     matches = process.extract(
-        q.lower(), list(title_to_idx.index),
+        q.lower(), list(search_df['title_lower']),
         scorer=fuzz.token_sort_ratio, limit=5
     )
     return {

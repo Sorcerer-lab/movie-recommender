@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+from collections import defaultdict
 from pathlib import Path
 import ast
 import re
@@ -209,13 +210,39 @@ def find_best_title_match(title, search_df, threshold=60):
 
 def build_content_model(tmdb_df):
     """
-    Returns:
-        df          — cleaned TMDB dataframe
-        tfidf_matrix
-        tfidf       — fitted vectorizer
-        id_to_idx   — TMDB movie id → dataframe row index
-        search_df   — lightweight search table for fuzzy matching
+    Loads pretrained TF-IDF from disk if available.
+    Only builds from scratch if no saved model exists.
     """
+    import scipy.sparse
+
+    tmdb_pkl = Path("models/tmdb_clean.pkl")
+
+    if tmdb_pkl.exists():
+        print("Loading pre-trained TF-IDF from disk...")
+        tmdb_clean   = pd.read_pickle("models/tmdb_clean.pkl")
+        tfidf_matrix = scipy.sparse.load_npz(
+            "models/tfidf_matrix.npz"
+        )
+        with open("models/tfidf_vectorizer.pkl", "rb") as f:
+            tfidf = pickle.load(f)
+
+        id_to_idx = pd.Series(
+            tmdb_clean.index, index=tmdb_clean['id']
+        )
+        search_df = tmdb_clean[
+            ['id', 'title', 'release_date',
+             'genre_names', 'vote_count']
+        ].copy()
+        search_df['title_lower'] = (
+            search_df['title'].fillna('').str.lower().str.strip()
+        )
+        print(f"✓ Pre-trained TF-IDF loaded "
+              f"({tmdb_clean.shape[0]} movies)")
+        return tmdb_clean, tfidf_matrix, tfidf, id_to_idx, search_df
+
+    # ── no pretrained model — build from scratch ──────────────
+    print("Building TF-IDF from scratch...")
+
     df = tmdb_df.copy().reset_index(drop=True)
     df['overview']      = df['overview'].fillna('')
     df['genre_names']   = df['genre_names'].fillna('')
@@ -246,9 +273,9 @@ def build_content_model(tmdb_df):
 
     df['soup_len'] = df['soup'].str.split().str.len()
     df = df[df['soup_len'] >= 10].reset_index(drop=True)
-    print(f"  After filtering sparse movies: {len(df)} remaining")
+    print(f"  After filtering: {len(df)} movies remaining")
 
-    print("\nBuilding TF-IDF matrix...")
+    print("Building TF-IDF matrix...")
     tfidf = TfidfVectorizer(
         stop_words='english',
         max_features=15000,
@@ -257,10 +284,14 @@ def build_content_model(tmdb_df):
     tfidf_matrix = tfidf.fit_transform(df['soup'])
     print(f"✓ TF-IDF matrix shape: {tfidf_matrix.shape}")
 
-    # ── ID based index — no duplicate title issues ─────────────
-    id_to_idx = pd.Series(df.index, index=df['id'])
+    # save for future runs
+    df.to_pickle("models/tmdb_clean.pkl")
+    scipy.sparse.save_npz("models/tfidf_matrix.npz", tfidf_matrix)
+    with open("models/tfidf_vectorizer.pkl", "wb") as f:
+        pickle.dump(tfidf, f)
+    print("✓ TF-IDF saved to disk")
 
-    # ── search table for fuzzy matching ───────────────────────
+    id_to_idx = pd.Series(df.index, index=df['id'])
     search_df = df[['id', 'title', 'release_date',
                     'genre_names', 'vote_count']].copy()
     search_df['title_lower'] = (
@@ -268,7 +299,6 @@ def build_content_model(tmdb_df):
     )
 
     return df, tfidf_matrix, tfidf, id_to_idx, search_df
-
 
 def get_content_recommendations(title, tmdb_df, tfidf_matrix,
                                 id_to_idx, search_df, n=10,
@@ -367,6 +397,173 @@ def build_collab_model(ratings_df,
     print(f"✓ User-movie matrix shape: {user_movie_matrix.shape}")
     return user_movie_matrix, df
 
+def train_cluster_model(ratings_df, n_clusters=100):
+    """
+    Train user clusters locally.
+    Groups users with similar taste into clusters.
+    CF then only compares within the same cluster
+    instead of against all users — faster and more accurate.
+    """
+    from sklearn.cluster import MiniBatchKMeans
+    from sklearn.preprocessing import normalize
+
+    print("\nTraining user clusters locally...")
+
+    top_movies = ratings_df['movieId'].value_counts().head(3000).index
+    top_users  = ratings_df['userId'].value_counts().head(50000).index
+
+    filtered = ratings_df[
+        ratings_df['movieId'].isin(top_movies) &
+        ratings_df['userId'].isin(top_users)
+    ]
+
+    print(f"  {filtered['userId'].nunique()} users x "
+          f"{filtered['movieId'].nunique()} movies")
+
+    user_movie = filtered.pivot_table(
+        index='userId', columns='movieId', values='rating'
+    ).fillna(0)
+
+    user_ids = list(user_movie.index)
+    mat      = normalize(
+        user_movie.values.astype(np.float32), norm='l2'
+    )
+
+    print(f"  Clustering into {n_clusters} groups...")
+    kmeans = MiniBatchKMeans(
+        n_clusters=n_clusters, random_state=42,
+        batch_size=2000, n_init=10
+    )
+    cluster_labels = kmeans.fit_predict(mat)
+
+    user_cluster  = {
+        user_ids[i]: int(cluster_labels[i])
+        for i in range(len(user_ids))
+    }
+    cluster_users = {}
+    for uid, cid in user_cluster.items():
+        cluster_users.setdefault(cid, []).append(uid)
+
+    cluster_data = {
+        'user_cluster':  user_cluster,
+        'cluster_users': cluster_users,
+        'user_ids':      user_ids,
+        'movie_ids':     list(user_movie.columns),
+        'n_clusters':    n_clusters,
+        'kmeans':        kmeans
+    }
+
+    with open("models/cluster_data.pkl", "wb") as f:
+        pickle.dump(cluster_data, f)
+
+    sizes = [len(v) for v in cluster_users.values()]
+    print(f"✓ Clusters saved — "
+          f"min={min(sizes)} max={max(sizes)} "
+          f"mean={int(np.mean(sizes))} users per cluster")
+
+    return cluster_data
+
+
+def build_clustered_collab_model(ratings_df):
+    """
+    Load pre-trained clusters if available.
+    Auto-trains if not found.
+    """
+    cluster_path = Path("models/cluster_data.pkl")
+    if cluster_path.exists():
+        with open(cluster_path, "rb") as f:
+            cluster_data = pickle.load(f)
+        print(f"✓ Cluster model loaded — "
+              f"{cluster_data['n_clusters']} clusters, "
+              f"{len(cluster_data['user_cluster'])} users")
+        return cluster_data
+    else:
+        print("  No cluster model found — training now...")
+        return train_cluster_model(ratings_df)
+
+def get_user_cluster(user_id, cluster_data, ratings_df):
+    """
+    Get cluster for any user — known or unknown.
+    For unknown users: build their rating vector
+    and assign to nearest cluster centroid.
+    """
+    user_cluster  = cluster_data['user_cluster']
+    cluster_users = cluster_data['cluster_users']
+
+    # known user — direct lookup
+    if user_id in user_cluster:
+        return user_cluster[user_id]
+
+    # unknown user — find nearest cluster
+    kmeans    = cluster_data.get('kmeans')
+    movie_ids = cluster_data['movie_ids']
+
+    if kmeans is None:
+        # fallback to largest cluster
+        return max(cluster_users, key=lambda c: len(cluster_users[c]))
+
+    from sklearn.preprocessing import normalize
+     # build this user's rating vector
+    user_ratings = ratings_df[
+        ratings_df['userId'] == user_id
+    ].set_index('movieId')['rating']
+
+    user_vec = np.array([
+        user_ratings.get(mid, 0.0) for mid in movie_ids
+    ], dtype=np.float32).reshape(1, -1)
+
+    user_vec_norm = normalize(user_vec, norm='l2')
+    cluster_id    = int(kmeans.predict(user_vec_norm)[0])
+
+    print(f"  → Unknown user {user_id} assigned to "
+          f"cluster {cluster_id}")
+    return cluster_id
+
+def get_clustered_collab_recommendations(user_id, cluster_data,
+                                          ratings_df, n=10):
+    cluster_users = cluster_data['cluster_users']
+
+    # get cluster — works for both known and unknown users
+    cluster_id    = get_user_cluster(
+        user_id, cluster_data, ratings_df
+    )
+    similar_users = cluster_users.get(cluster_id, [])
+
+    print(f"  → User {user_id} cluster {cluster_id} "
+          f"({len(similar_users)} similar users)")
+
+    seen_movies = set(
+        ratings_df[ratings_df['userId'] == user_id]['movieId']
+    )
+
+    candidate_scores = defaultdict(float)
+    candidate_counts = defaultdict(int)
+
+    for sim_user in similar_users:
+        if sim_user == user_id:
+            continue
+        sim_ratings = ratings_df[
+            (ratings_df['userId'] == sim_user) &
+            (ratings_df['rating'] >= 4.0) &
+            (~ratings_df['movieId'].isin(seen_movies))
+        ]
+        for _, row in sim_ratings.iterrows():
+            mid = row['movieId']
+            candidate_scores[mid] += row['rating']
+            candidate_counts[mid] += 1
+
+    # weight by avg rating × log(number of recommenders)
+    weighted = {
+        mid: (candidate_scores[mid] / candidate_counts[mid])
+             * np.log1p(candidate_counts[mid])
+        for mid in candidate_scores
+    }
+
+    top = sorted(weighted.items(),
+                 key=lambda x: x[1], reverse=True)[:n]
+
+    return [{'movieId': mid, 'score': round(score, 4)}
+            for mid, score in top]
 
 def get_collab_recommendations(user_id, user_movie_matrix,
                                 ratings_df, n=10):
@@ -408,18 +605,29 @@ def get_collab_recommendations(user_id, user_movie_matrix,
 # 5. SVD MATRIX FACTORIZATION
 # ══════════════════════════════════════════════════════════════
 
-def build_svd_model(ratings_df, n_factors=20):
-    print("\nBuilding SVD model...")
+def build_svd_model(ratings_df, n_factors=50):
+    """
+    Loads pretrained SVD from disk if available.
+    Only trains from scratch if no saved model exists.
+    """
+    svd_path = Path("models/svd_model.pkl")
+    if svd_path.exists():
+        with open(svd_path, "rb") as f:
+            data = pickle.load(f)
+        print("✓ Loaded pre-trained SVD from disk")
+        return data
 
-    top_movies = ratings_df['movieId'].value_counts().head(500).index
-    top_users  = ratings_df['userId'].value_counts().head(2000).index
+    print("\nBuilding SVD model from scratch...")
+
+    top_movies = ratings_df['movieId'].value_counts().head(1000).index
+    top_users  = ratings_df['userId'].value_counts().head(3000).index
 
     filtered = ratings_df[
         ratings_df['movieId'].isin(top_movies) &
         ratings_df['userId'].isin(top_users)
     ]
 
-    print(f"  Filtered to: {filtered['userId'].nunique()} users "
+    print(f"  Filtered: {filtered['userId'].nunique()} users "
           f"x {filtered['movieId'].nunique()} movies")
 
     user_movie = filtered.pivot_table(
@@ -428,24 +636,34 @@ def build_svd_model(ratings_df, n_factors=20):
 
     user_ids  = list(user_movie.index)
     movie_ids = list(user_movie.columns)
-    print(f"  Matrix shape: {user_movie.shape}")
+    mat       = user_movie.values.astype(np.float32)
 
-    mat = csr_matrix(user_movie.values, dtype=np.float32)
-    k   = min(n_factors, min(mat.shape) - 1)
+    # mean center
+    user_means = np.true_divide(
+        mat.sum(axis=1),
+        (mat != 0).sum(axis=1).clip(min=1)
+    )
+    mat_centered = mat.copy()
+    for i, mean in enumerate(user_means):
+        mat_centered[i][mat[i] != 0] -= mean
+
+    sparse_mat    = csr_matrix(mat_centered)
+    k             = min(n_factors, min(sparse_mat.shape) - 1)
     print(f"  Running SVD with {k} factors...")
 
-    U, sigma, Vt  = svds(mat, k=k)
+    U, sigma, Vt  = svds(sparse_mat, k=k)
     predicted_mat = np.dot(np.dot(U, np.diag(sigma)), Vt)
-    print("✓ SVD complete!")
+    predicted_mat += user_means.reshape(-1, 1)
+    predicted_mat  = np.clip(predicted_mat, 0.5, 5.0)
 
     svd_data = {
         'predicted_matrix': predicted_mat,
         'user_ids':         user_ids,
         'movie_ids':        movie_ids
     }
-    with open("models/svd_model.pkl", "wb") as f:
+    with open(svd_path, "wb") as f:
         pickle.dump(svd_data, f)
-    print("✓ SVD model saved")
+    print("✓ SVD saved")
     return svd_data
 
 
@@ -507,8 +725,23 @@ def hybrid_recommend(user_id, user_movie_matrix, ratings_df,
                      alpha=0.4, beta=0.3, gamma=0.3, n=10):
     print(f"\nGenerating hybrid recommendations for user {user_id}...")
 
-    collab_recs = get_collab_recommendations(
-        user_id, user_movie_matrix, ratings_df, n=50)
+    # use clustered CF if available, else item-based CF
+    # use clustered CF if available — load once, reuse
+    # _cluster_cache avoids reloading pkl on every call
+    if not hasattr(hybrid_recommend, '_cluster_cache'):
+        hybrid_recommend._cluster_cache = \
+            build_clustered_collab_model(ratings_df)
+
+    cluster_data = hybrid_recommend._cluster_cache
+
+    if cluster_data:
+        collab_recs = get_clustered_collab_recommendations(
+            user_id, cluster_data, ratings_df, n=50
+        )
+    else:
+        collab_recs = get_collab_recommendations(
+            user_id, user_movie_matrix, ratings_df, n=50
+        )
     svd_recs    = get_svd_recommendations(
         user_id, svd_data, ratings_df, movies_df, n=50)
 

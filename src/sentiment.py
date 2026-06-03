@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import re
 from pathlib import Path
+import math
 
 # ── VADER ─────────────────────────────────────────────────────
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
@@ -96,53 +97,74 @@ def evaluate_vader(df, analyzer, sample=500):
 # 2. RE-RANKER — adjust hybrid scores using sentiment
 # ══════════════════════════════════════════════════════════════
 
+
 def rerank_with_sentiment(hybrid_recs, analyzer,
+                           tmdb_df=None,
                            sentiment_weight=0.2):
     """
-    Takes the hybrid recommendation list and re-ranks using sentiment.
+    Re-ranks recommendations using TMDB vote_average
+    and vote_count as a quality + popularity signal.
 
-    In production you would fetch real reviews per movie from an API.
-    Here we simulate sentiment scores using VADER on sample IMDB reviews
-    to demonstrate the re-ranking mechanism.
+    sentiment_score = (vote_average/10) × confidence
+    confidence      = log10(vote_count+1)/5 capped at 1.0
 
-    Final score = (hybrid_score × (1 - w)) + (sentiment_score × w)
-    where sentiment_score is normalized from [-1,+1] to [0,1]
+    This means a movie needs BOTH a good rating AND
+    enough votes to get a high score.
     """
     print(f"\nRe-ranking {len(hybrid_recs)} recommendations "
-          f"with sentiment (weight={sentiment_weight})...")
-
-    # simulate per-movie sentiment with varied scores
-    # in production: fetch actual reviews for each movie title
-    import random
-    random.seed(42)
+          f"(sentiment_weight={sentiment_weight})...")
 
     results = []
     for rec in hybrid_recs:
-        # simulate: generate a plausible sentiment score
-        # positive bias since these are already good recommendations
-        raw_sentiment = random.uniform(0.1, 0.9)
+        title = rec['title']
 
-        # normalize sentiment from [0,1] range
-        sentiment_norm = raw_sentiment
+        # ── look up TMDB quality score ─────────────────────────
+        sentiment_score = 0.5  # neutral default
 
-        # combine
+        if tmdb_df is not None:
+            # try exact match first
+            row = tmdb_df[
+                tmdb_df['title'].str.lower() == title.lower()
+            ]
+            # fallback — strip year and retry
+            if len(row) == 0:
+                clean = re.sub(r'\s*\(\d{4}\)\s*$', '',
+                               title).strip().lower()
+                row = tmdb_df[
+                    tmdb_df['title'].str.lower() == clean
+                ]
+
+            if len(row) > 0:
+                r          = row.iloc[0]
+                vote_avg   = float(r.get('vote_average', 5) or 5)
+                vote_count = float(r.get('vote_count',   0) or 0)
+
+                # normalise 0-10 → 0-1
+                quality = vote_avg / 10.0
+
+                # confidence: log scale so 10K votes isn't
+                # 1000x better than 10 votes
+                confidence = min(
+                    math.log10(vote_count + 1) / 5.0, 1.0
+                )
+
+                sentiment_score = round(quality * confidence, 4)
+
+        # ── combine hybrid + quality scores ───────────────────
         final_score = (
             rec['hybrid_score'] * (1 - sentiment_weight) +
-            sentiment_norm      * sentiment_weight
+            sentiment_score     * sentiment_weight
         )
 
         results.append({
-            'title':          rec['title'],
-            'hybrid_score':   rec['hybrid_score'],
-            'sentiment_score': round(raw_sentiment, 4),
-            'final_score':    round(final_score, 4)
+            'title':           rec['title'],
+            'hybrid_score':    rec['hybrid_score'],
+            'sentiment_score': sentiment_score,
+            'final_score':     round(final_score, 4)
         })
 
-    # re-rank by final score
     results.sort(key=lambda x: x['final_score'], reverse=True)
     return results
-
-
 # ══════════════════════════════════════════════════════════════
 # MAIN — test VADER pipeline
 # ══════════════════════════════════════════════════════════════

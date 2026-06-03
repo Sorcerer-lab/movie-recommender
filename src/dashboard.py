@@ -249,10 +249,11 @@ with st.sidebar:
                            label_visibility="collapsed")
         st.markdown("<span class='section-label' "
                     "style='margin-top:12px;display:block;'>"
-                    "Sentiment weight</span>",
+                    "Audience quality weight</span>",
                     unsafe_allow_html=True)
         sw = st.slider("", 0.0, 0.5, 0.2, 0.05,
-                       label_visibility="collapsed")
+                       label_visibility="collapsed",
+                       help="How much audience ratings affect ranking")
         go_btn = st.button("Get Recommendations")
 
     else:
@@ -479,9 +480,12 @@ if mode == "For You":
                 clean    = strip_year(title)
                 pct      = int(r['final_score'] / max_score * 100)
                 sent     = r.get('sentiment_score', 0.5)
-                sent_lbl = ("Loved" if sent > 0.7
-                             else "Liked" if sent > 0.4
-                             else "Mixed")
+                sent_lbl = r.get('audience_label',
+                    "Highly rated"    if sent > 0.70 else
+                    "Well rated"      if sent > 0.50 else
+                    "Mixed reception" if sent > 0.30 else
+                    "Limited ratings"
+                )
                 expl     = r.get('explanation', '')
                 emoji    = genre_emoji(r.get('genres', ''))
                 grad     = tile_gradient(i)
@@ -498,7 +502,7 @@ if mode == "For You":
                             {r['final_score']:.3f} match
                         </div>
                         <div class='tile-audience'>
-                            Audience: {sent_lbl} ({sent:.2f})
+                            {sent_lbl} · {sent:.2f}
                         </div>
                         <div class='tile-bar-bg'>
                             <div class='tile-bar-fg'
