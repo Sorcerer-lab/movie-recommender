@@ -360,7 +360,7 @@ def evaluate_sentiment(imdb_df, n_samples=300):
 # WEIGHT OPTIMIZATION
 # ══════════════════════════════════════════════════════════════
 
-def optimize_weights(user_movie_matrix, train_ratings,
+""" def optimize_weights(user_movie_matrix, train_ratings,
                      test_ratings, movies_df, tmdb_df,
                      tfidf_matrix, id_to_idx,
                      search_df, svd_data):
@@ -469,7 +469,7 @@ def optimize_weights(user_movie_matrix, train_ratings,
         }, f, indent=2)
     print("  ✓ Saved to models/optimal_weights.json")
 
-    return best_weights, results_df
+    return best_weights, results_df  """
 
 
 def print_report(title, results):
@@ -575,12 +575,12 @@ if __name__ == "__main__":
     print_report("FULL HYBRID SYSTEM", hybrid_results)
 
     # ── 5. weight optimization ────────────────────────────────
-    best_weights, _ = optimize_weights(
+    """ best_weights, _ = optimize_weights(
         user_movie_matrix, train_ratings,
         test_ratings, movies, tmdb_clean,
         tfidf_matrix, id_to_idx,
         search_df, svd_data
-    )
+    ) """
 
     # ── 6. final summary ──────────────────────────────────────
     print("\n" + "="*55)
@@ -602,8 +602,8 @@ if __name__ == "__main__":
           f"{sentiment_results['VADER accuracy']}")
     print(f"  DistilBERT Accuracy        : "
           f"{sentiment_results['DistilBERT accuracy']}")
-    print(f"  Optimal Weights            : "
-          f"α={best_weights[0]} β={best_weights[1]} "
-          f"γ={best_weights[2]}")
+   # print(f"  Optimal Weights            : "
+        #  f"α={best_weights[0]} β={best_weights[1]} "
+         # f"γ={best_weights[2]}")
     print("="*55)
     print("\n✓ Evaluation complete!")

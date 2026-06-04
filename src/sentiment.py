@@ -100,33 +100,56 @@ def evaluate_vader(df, analyzer, sample=500):
 
 def rerank_with_sentiment(hybrid_recs, analyzer,
                            tmdb_df=None,
-                           sentiment_weight=0.2):
+                           distilbert_model=None,
+                           distilbert_tokenizer=None,
+                           hybrid_weight=0.70,
+                           tmdb_weight=0.15,
+                           distilbert_weight=0.15):
     """
-    Re-ranks recommendations using TMDB vote_average
-    and vote_count as a quality + popularity signal.
+    Re-ranks recommendations using a three-component scoring formula:
 
-    sentiment_score = (vote_average/10) × confidence
-    confidence      = log10(vote_count+1)/5 capped at 1.0
+        final_score = 0.70 × hybrid_score
+                    + 0.15 × tmdb_score
+                    + 0.15 × distilbert_score
 
-    This means a movie needs BOTH a good rating AND
-    enough votes to get a high score.
+    tmdb_score
+        Derived from TMDB vote_average and vote_count.
+        tmdb_score = (vote_average / 10) × confidence
+        confidence = log10(vote_count + 1) / 5, capped at 1.0
+        Default = 0.5 when TMDB data is unavailable.
+
+    distilbert_score
+        Probability of positive sentiment (0–1) from the
+        fine-tuned DistilBERT model run on the movie's overview.
+        Falls back to VADER compound score (mapped 0–1) if the
+        DistilBERT model is not loaded.
+        Default = 0.5 when no text is available.
+
+    Weights must sum to 1.0. The defaults (0.70 / 0.15 / 0.15)
+    can be overridden via the parameters.
     """
+    assert abs(hybrid_weight + tmdb_weight + distilbert_weight - 1.0) < 1e-6, \
+        "hybrid_weight + tmdb_weight + distilbert_weight must equal 1.0"
+
     print(f"\nRe-ranking {len(hybrid_recs)} recommendations "
-          f"(sentiment_weight={sentiment_weight})...")
+          f"(hybrid={hybrid_weight}, tmdb={tmdb_weight}, "
+          f"distilbert={distilbert_weight})...")
 
     results = []
     for rec in hybrid_recs:
         title = rec['title']
 
-        # ── look up TMDB quality score ─────────────────────────
-        sentiment_score = 0.5  # neutral default
+        # ── 1. TMDB score (vote quality × popularity confidence) ──
+        tmdb_score = 0.5  # neutral default
+
+        overview_text = ''  # collect for DistilBERT below
 
         if tmdb_df is not None:
-            # try exact match first
+            # exact title match
             row = tmdb_df[
                 tmdb_df['title'].str.lower() == title.lower()
             ]
-            # fallback — strip year and retry
+            # fallback: strip year suffix e.g. "Toy Story (1995)"
             if len(row) == 0:
                 clean = re.sub(r'\s*\(\d{4}\)\s*$', '',
                                title).strip().lower()
@@ -139,28 +162,57 @@ def rerank_with_sentiment(hybrid_recs, analyzer,
                 vote_avg   = float(r.get('vote_average', 5) or 5)
                 vote_count = float(r.get('vote_count',   0) or 0)
 
-                # normalise 0-10 → 0-1
+                # normalise vote_average 0-10 → 0-1
                 quality = vote_avg / 10.0
 
-                # confidence: log scale so 10K votes isn't
-                # 1000x better than 10 votes
+                # log-scale confidence: rewards volume without
+                # letting blockbusters dominate completely
                 confidence = min(
                     math.log10(vote_count + 1) / 5.0, 1.0
                 )
 
-                sentiment_score = round(quality * confidence, 4)
+                tmdb_score = round(quality * confidence, 4)
 
-        # ── combine hybrid + quality scores ───────────────────
-        final_score = (
-            rec['hybrid_score'] * (1 - sentiment_weight) +
-            sentiment_score     * sentiment_weight
+                # grab overview for DistilBERT
+                overview_text = str(r.get('overview', '') or '')
+
+        # ── 2. DistilBERT sentiment score ─────────────────────────
+        db_score = 0.5  # neutral default
+
+        if overview_text:
+            if distilbert_model is not None and \
+               distilbert_tokenizer is not None:
+                # use fine-tuned DistilBERT on movie overview
+                try:
+                    db_score = distilbert_score(
+                        overview_text,
+                        distilbert_model,
+                        distilbert_tokenizer
+                    )
+                except Exception:
+                    db_score = 0.5
+            else:
+                # fallback: VADER compound mapped from [-1,1] → [0,1]
+                compound = analyzer.polarity_scores(
+                    overview_text
+                )['compound']
+                db_score = round((compound + 1) / 2, 4)
+
+        # ── 3. Weighted final score ────────────────────────────────
+        final_score = round(
+            hybrid_weight     * rec['hybrid_score'] +
+            tmdb_weight       * tmdb_score          +
+            distilbert_weight * db_score,
+            4
         )
 
         results.append({
-            'title':           rec['title'],
-            'hybrid_score':    rec['hybrid_score'],
-            'sentiment_score': sentiment_score,
-            'final_score':     round(final_score, 4)
+            'title':             rec['title'],
+            'hybrid_score':      rec['hybrid_score'],
+            'tmdb_score':        tmdb_score,
+            'distilbert_score':  round(db_score, 4),
+            'sentiment_score':   round(db_score, 4),  # kept for dashboard compatibility
+            'final_score':       final_score
         })
 
     results.sort(key=lambda x: x['final_score'], reverse=True)

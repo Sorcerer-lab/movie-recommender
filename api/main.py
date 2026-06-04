@@ -58,7 +58,6 @@ if tmdb_pkl.exists():
     with open("models/tfidf_vectorizer.pkl", "rb") as f:
         tfidf = pickle.load(f)
 
-    # rebuild id_to_idx and search_df
     id_to_idx = pd.Series(
         tmdb_clean.index, index=tmdb_clean['id']
     )
@@ -88,9 +87,7 @@ else:
     svd_data = build_svd_model(ratings)
     print("✓ SVD built")
 
-# ── collaborative filter — always build fresh ─────────────────
 # ── collaborative filter + clusters ───────────────────────────
-from src.recommender import build_clustered_collab_model
 user_movie_matrix, ratings_filtered = build_collab_model(ratings)
 cluster_data = build_clustered_collab_model(ratings)
 vader_analyzer = build_vader()
@@ -101,9 +98,12 @@ try:
     USE_DISTILBERT = True
     print("✓ DistilBERT loaded")
 except Exception as e:
-    print(f"⚠ DistilBERT not available ({e}), using VADER only")
+    print(f"⚠ DistilBERT not available ({e}), using VADER fallback")
+    db_model      = None
+    db_tokenizer  = None
     USE_DISTILBERT = False
-    # ── load optimal weights ──────────────────────────────────────
+
+# ── load optimal hybrid weights ───────────────────────────────
 weights_path = Path("models/optimal_weights.json")
 if weights_path.exists():
     with open(weights_path) as f:
@@ -116,21 +116,13 @@ else:
     ALPHA, BETA, GAMMA = 0.4, 0.3, 0.3
     print("⚠ Using default weights α=0.4 β=0.3 γ=0.3")
 
+# ── final score weights (fixed per your spec) ─────────────────
+HYBRID_W     = 0.70   # weight for hybrid_score
+TMDB_W       = 0.15   # weight for TMDB vote quality score
+DISTILBERT_W = 0.15   # weight for DistilBERT sentiment score
+
+print(f"✓ Final score = {HYBRID_W}×hybrid + {TMDB_W}×tmdb + {DISTILBERT_W}×distilbert")
 print("✓ All models ready — API is live!")
-
-# ══════════════════════════════════════════════════════════════
-# HELPER
-# ══════════════════════════════════════════════════════════════
-
-def get_sentiment_score(text):
-    """Use DistilBERT if available, else VADER."""
-    if USE_DISTILBERT:
-        raw = distilbert_score(text, db_model, db_tokenizer)
-        return raw  # already 0-1
-    else:
-        from src.sentiment import vader_score
-        raw = vader_score(text, vader_analyzer)
-        return (raw + 1) / 2   # map -1..+1 → 0..1
 
 
 # ══════════════════════════════════════════════════════════════
@@ -141,23 +133,31 @@ def get_sentiment_score(text):
 def root():
     return {
         "message": "Movie Recommender API is running!",
-        "endpoints": ["/recommend", "/similar", "/user/{user_id}/profile"]
+        "endpoints": ["/recommend", "/similar", "/user/{user_id}/profile"],
+        "scoring": {
+            "formula": "final = 0.70×hybrid + 0.15×tmdb + 0.15×distilbert",
+            "distilbert_active": USE_DISTILBERT
+        }
     }
 
 
 @app.get("/recommend")
-def recommend(user_id: int, n: int = 10,
-              sentiment_weight: float = 0.2):
+def recommend(user_id: int, n: int = 10):
     """
-    Get hybrid recommendations for a user, re-ranked by sentiment.
+    Get hybrid recommendations for a user, re-ranked by the
+    three-component scoring formula:
 
-    Parameters:
-        user_id          — MovieLens user ID
-        n                — number of recommendations (default 10)
-        sentiment_weight — how much sentiment affects ranking (0-1)
+        final_score = 0.70 × hybrid_score
+                    + 0.15 × tmdb_score          (vote quality × confidence)
+                    + 0.15 × distilbert_score     (sentiment of movie overview)
+
+    Parameters
+    ----------
+    user_id : int   — MovieLens user ID
+    n       : int   — number of recommendations to return (default 10)
     """
     try:
-        # get hybrid recommendations
+        # ── step 1: generate hybrid candidates ────────────────
         hybrid_recs = hybrid_recommend(
             user_id           = user_id,
             user_movie_matrix = user_movie_matrix,
@@ -169,7 +169,7 @@ def recommend(user_id: int, n: int = 10,
             search_df         = search_df,
             svd_data          = svd_data,
             alpha=ALPHA, beta=BETA, gamma=GAMMA,
-            n=n * 2
+            n=n * 2          # oversample, trim after re-ranking
         )
 
         if not hybrid_recs:
@@ -178,29 +178,44 @@ def recommend(user_id: int, n: int = 10,
                 detail=f"No recommendations found for user {user_id}"
             )
 
-        # re-rank with sentiment
+        # ── step 2: re-rank with 3-component formula ──────────
         reranked = rerank_with_sentiment(
             hybrid_recs,
             vader_analyzer,
-            tmdb_df          = tmdb_clean,
-            sentiment_weight = sentiment_weight
+            tmdb_df              = tmdb_clean,
+            distilbert_model     = db_model,        # None → VADER fallback
+            distilbert_tokenizer = db_tokenizer,
+            hybrid_weight        = HYBRID_W,
+            tmdb_weight          = TMDB_W,
+            distilbert_weight    = DISTILBERT_W
         )[:n]
+
+        # ── step 3: add audience label for dashboard ──────────
         for r in reranked:
-            s = r.get('sentiment_score', 0.5)
+            s = r.get('distilbert_score', r.get('sentiment_score', 0.5))
             r['audience_label'] = (
-                "Highly rated"    if s > 0.70 else
-                "Well rated"      if s > 0.50 else
-                "Mixed reception" if s > 0.30 else
+                "Audiences loved it" if s > 0.75 else
+                "Highly rated"       if s > 0.60 else
+                "Well rated"         if s > 0.45 else
+                "Mixed reception"    if s > 0.30 else
                 "Limited ratings"
             )
+
+        # ── step 4: add rule-based explanations ───────────────
         explained = explain_recommendations(
             reranked, ratings, movies, user_id
         )
+
         return {
-            "user_id":         user_id,
-            "count":           len(reranked),
-            "sentiment_weight": sentiment_weight,
-            "recommendations":explained
+            "user_id":   user_id,
+            "count":     len(explained),
+            "scoring": {
+                "hybrid_weight":     HYBRID_W,
+                "tmdb_weight":       TMDB_W,
+                "distilbert_weight": DISTILBERT_W,
+                "distilbert_active": USE_DISTILBERT
+            },
+            "recommendations": explained
         }
 
     except HTTPException:
@@ -212,6 +227,16 @@ def recommend(user_id: int, n: int = 10,
 @app.get("/similar")
 def similar(title: str, n: int = 10,
             genre: str = None, lang: str = None):
+    """
+    Find movies similar to the given title using TF-IDF content similarity.
+
+    Parameters
+    ----------
+    title : str         — movie title (fuzzy matched)
+    n     : int         — number of results (default 10)
+    genre : str | None  — optional genre filter e.g. "Action"
+    lang  : str | None  — optional language code e.g. "en", "hi", "ko"
+    """
     try:
         recs = get_content_recommendations(
             title, tmdb_clean, tfidf_matrix,
@@ -222,7 +247,7 @@ def similar(title: str, n: int = 10,
         if not recs:
             raise HTTPException(
                 status_code=404,
-                detail=f"No results for '{title}'."
+                detail=f"No results found for '{title}'."
             )
         return {
             "query_title": title,
@@ -234,11 +259,13 @@ def similar(title: str, n: int = 10,
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/user/{user_id}/profile")
 def user_profile(user_id: int):
     """
-    Get a user's taste profile — genre preferences and rating history.
-    Used by the Streamlit dashboard to build charts.
+    Return a user's taste profile: genre breakdown, decade breakdown,
+    average rating, and top-rated movies.
+    Used by the Streamlit dashboard to render charts.
     """
     user_ratings = ratings[ratings['userId'] == user_id]
 
@@ -248,21 +275,17 @@ def user_profile(user_id: int):
             detail=f"User {user_id} not found"
         )
 
-    # join with movies to get genres
     merged = user_ratings.merge(movies, on='movieId')
 
-    # extract decade from title year
     def extract_decade(title):
         match = re.search(r'\((\d{4})\)', title)
         if match:
-            year    = int(match.group(1))
-            decade  = (year // 10) * 10
+            decade = (int(match.group(1)) // 10) * 10
             return f"{decade}s"
         return "Unknown"
 
     merged['decade'] = merged['title'].apply(extract_decade)
 
-    # genre breakdown
     genre_counts = {}
     for _, row in merged.iterrows():
         for genre in str(row['genres']).split('|'):
@@ -270,10 +293,8 @@ def user_profile(user_id: int):
             if genre and genre != 'nan':
                 genre_counts[genre] = genre_counts.get(genre, 0) + 1
 
-    # decade breakdown
     decade_counts = merged['decade'].value_counts().to_dict()
 
-    # top rated movies
     top_rated = (
         merged.sort_values('rating', ascending=False)
         .head(10)[['title', 'rating', 'genres']]
@@ -288,6 +309,17 @@ def user_profile(user_id: int):
         "decade_counts": decade_counts,
         "top_rated":     top_rated
     }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status":            "ok",
+        "distilbert_active": USE_DISTILBERT,
+        "scoring_formula":   f"{HYBRID_W}×hybrid + {TMDB_W}×tmdb + {DISTILBERT_W}×distilbert"
+    }
+
+
 @app.get("/search-title")
 def search_title(q: str):
     from rapidfuzz import process, fuzz

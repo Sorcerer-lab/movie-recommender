@@ -259,20 +259,34 @@ def build_content_model(tmdb_df):
         df['vote_count'], errors='coerce'
     ).fillna(0)
 
-    df['soup'] = (
-        df['genre_names']   + ' ' +
-        df['genre_names']   + ' ' +
-        df['genre_names']   + ' ' +
-        df['keyword_names'] + ' ' +
-        df['keyword_names'] + ' ' +
-        df['director_name'] + ' ' +
-        df['director_name'] + ' ' +
-        df['cast_names']    + ' ' +
-        df['overview']
-    )
+    tmdb['soup'] = (
+    tmdb['original_language']   + ' ' +
+    tmdb['original_language']   + ' ' +
+    tmdb['original_language']   + ' ' +
+    tmdb['genre_names']   + ' ' +
+    tmdb['genre_names']   + ' ' +
+    tmdb['genre_names']   + ' ' +
+    tmdb['genre_names']   + ' ' +
+    tmdb['genre_names']   + ' ' +
+    tmdb['genre_names']   + ' ' +
+    tmdb['overview']   + ' ' +
+    tmdb['overview']   + ' ' +
+    tmdb['keyword_names'] + ' ' +
+    tmdb['keyword_names'] + ' ' +
+    tmdb['keyword_names'] + ' ' +
+    tmdb['keyword_names'] + ' ' +
+    tmdb['keyword_names'] + ' ' +
+    tmdb['director_name'] + ' ' +
+    tmdb['director_name'] + ' ' +
+    tmdb['director_name'] + ' ' +
+    tmdb['cast_names']    + ' ' +
+    tmdb['cast_names']    + ' ' +
+    tmdb['cast_names']    + ' ' +
+    tmdb['cast_names']
+)
 
     df['soup_len'] = df['soup'].str.split().str.len()
-    df = df[df['soup_len'] >= 10].reset_index(drop=True)
+    df = df[df['soup_len'] >= 20].reset_index(drop=True)
     print(f"  After filtering: {len(df)} movies remaining")
 
     print("Building TF-IDF matrix...")
@@ -324,22 +338,25 @@ def get_content_recommendations(title, tmdb_df, tfidf_matrix,
     movie_vec  = tfidf_matrix[idx]
     sim_scores = cosine_similarity(movie_vec, tfidf_matrix).flatten()
 
-    # popularity boost
+    # small popularity nudge — keeps obscure films from dominating
+    # but does NOT override genuine content similarity
     max_votes = tmdb_df['vote_count'].fillna(0).max()
     if max_votes > 0:
         pop_bonus  = (tmdb_df['vote_count'].fillna(0)
-                      / max_votes).values * 0.35
-        sim_scores = sim_scores * 0.65 + pop_bonus
+                      / max_votes).values * 0.10
+        sim_scores = sim_scores * 0.90 + pop_bonus
 
-    sim_indices = np.argsort(sim_scores)[::-1][1:n * 4 + 1]
+    sim_indices = np.argsort(sim_scores)[::-1][1:n * 8 + 1]
 
-    results = []
+    results    = []
+    seen_titles = set()  # deduplicate by normalised title
+
     for i in sim_indices:
         if len(results) >= n:
             break
         try:
             score  = float(sim_scores[i])
-            if score < 0.10:
+            if score < 0.15:          # raised from 0.10 — filters weak matches
                 continue
             row    = tmdb_df.iloc[int(i)]
             lang   = str(row.get('original_language', 'en'))
@@ -353,6 +370,12 @@ def get_content_recommendations(title, tmdb_df, tfidf_matrix,
             if genre_filter and \
                genre_filter.lower() not in genres.lower():
                 continue
+
+            # deduplicate: normalise title to lower-stripped form
+            norm_title = str(row['title']).lower().strip()
+            if norm_title in seen_titles:
+                continue
+            seen_titles.add(norm_title)
 
             results.append({
                 'title':             row['title'],
