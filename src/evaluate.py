@@ -27,6 +27,23 @@ def precision_at_k(recommended, relevant, k=10):
     hits = sum(1 for r in recommended[:k] if r in relevant)
     return hits / k
 
+def average_precision_at_k(
+    recommended,
+    relevant,
+    k=10
+):
+    score = 0.0
+    hits = 0
+
+    for i, item in enumerate(recommended[:k], 1):
+        if item in relevant:
+            hits += 1
+            score += hits / i
+
+    if len(relevant) == 0:
+        return 0.0
+
+    return score / min(len(relevant), k)
 
 def recall_at_k(recommended, relevant, k=10):
     if not relevant:
@@ -45,18 +62,75 @@ def ndcg_at_k(recommended, relevant, k=10):
                for i in range(1, ideal_hits + 1))
     return dcg / idcg if idcg > 0 else 0.0
 
+def hit_rate_at_k(recommended, relevant, k=10):
+    return int(
+        len(set(recommended[:k]) & relevant) > 0
+    )
+
+def mrr_at_k(
+    recommended,
+    relevant,
+    k=10
+):
+    for rank, item in enumerate(
+        recommended[:k],
+        1
+    ):
+        if item in relevant:
+            return 1.0 / rank
+
+    return 0.0
+
+
+from itertools import combinations
 
 def diversity_score(recs, tmdb_df):
-    all_genres = []
+
+    genre_sets = []
+
     for r in recs:
-        row = tmdb_df[tmdb_df['title'] == r.get('title','')]
-        if len(row) > 0:
-            all_genres.extend(
-                str(row.iloc[0]['genre_names']).split()
-            )
-    if not all_genres:
+
+        row = tmdb_df[
+            tmdb_df['title']
+            == r['title']
+        ]
+
+        if len(row) == 0:
+            continue
+
+        genres = set(
+            str(
+                row.iloc[0]['genre_names']
+            ).split()
+        )
+
+        genre_sets.append(genres)
+
+    if len(genre_sets) < 2:
         return 0.0
-    return round(len(set(all_genres)) / len(all_genres), 4)
+
+    similarities = []
+
+    for g1, g2 in combinations(
+        genre_sets,
+        2
+    ):
+        union = g1 | g2
+
+        if not union:
+            continue
+
+        sim = len(g1 & g2) / len(union)
+
+        similarities.append(sim)
+
+    if not similarities:
+        return 0.0
+
+    return round(
+        1 - np.mean(similarities),
+        4
+    )
 
 
 # ══════════════════════════════════════════════════════════════
@@ -114,18 +188,30 @@ def evaluate_clustered_collab(train_ratings, test_ratings,
     print(f"  Known test users: {len(known_users)} / "
           f"{len(all_test_users)}")
 
-    test_users = known_users[:n_users]
+    rng = np.random.default_rng(42)
+
+    if len(known_users) > n_users:
+      test_users = rng.choice(
+        known_users,
+        size=n_users,
+        replace=False
+    )
+    else:
+       test_users = known_users
 
     precisions = []
     recalls    = []
     ndcgs      = []
+    hit_rates  = []
+    mrrs       = []
+    maps       = []
     skipped    = 0
 
     for user_id in test_users:
         relevant = set(
             test_ratings[
                 (test_ratings['userId'] == user_id) &
-                (test_ratings['rating'] >= 4.0)
+                (test_ratings['rating'] >= 3.5)
             ]['movieId'].tolist()
         )
         if not relevant:
@@ -144,7 +230,9 @@ def evaluate_clustered_collab(train_ratings, test_ratings,
         precisions.append(precision_at_k(rec_ids, relevant, k))
         recalls.append(recall_at_k(rec_ids, relevant, k))
         ndcgs.append(ndcg_at_k(rec_ids, relevant, k))
-
+        hit_rates.append(hit_rate_at_k(rec_ids, relevant, k))
+        maps.append(average_precision_at_k(rec_ids, relevant, k))
+        mrrs.append(mrr_at_k(rec_ids, relevant, k))
     print(f"  Evaluated: {len(precisions)} | "
           f"Skipped: {skipped}")
 
@@ -153,8 +241,14 @@ def evaluate_clustered_collab(train_ratings, test_ratings,
                            if precisions else 0,
         f'Recall@{k}':     round(np.mean(recalls), 4)
                            if recalls else 0,
+        f'Hit Rate@{k}':   round(np.mean(hit_rates), 4)
+                           if hit_rates else 0,
+        f'MAP@{k}':        round(np.mean(maps), 4)
+                           if maps else 0,
         f'NDCG@{k}':       round(np.mean(ndcgs), 4)
                            if ndcgs else 0,
+        f'MRR@{k}':        round(np.mean(mrrs), 4)
+                           if mrrs else 0,
         'Users evaluated': len(precisions)
     }
 
@@ -187,21 +281,34 @@ def evaluate_hybrid(train_ratings, test_ratings,
 
     # prefer users who are in cluster model for fairness
     known = [u for u in all_test_users if u in user_cluster]
-    test_users = known[:n_users]
+    rng = np.random.default_rng(42)
+
+    if len(known) > n_users:
+      test_users = rng.choice(
+        known,
+        size=n_users,
+        replace=False
+    )
+    else:
+       test_users = known
 
     print(f"  Testing {len(test_users)} users...")
 
-    precisions = []
-    recalls    = []
-    ndcgs      = []
-    diversities= []
-    skipped    = 0
+    precisions    = []
+    recalls       = []
+    ndcgs         = []
+    hit_rates     = []
+    mrrs          = []
+    maps          = []
+    diversities   = []
+    skipped       = 0
+    all_recommended = set()
 
     for user_id in test_users:
         relevant = set(
             test_ratings[
                 (test_ratings['userId'] == user_id) &
-                (test_ratings['rating'] >= 4.0)
+                (test_ratings['rating'] >= 3.5)
             ]['movieId'].tolist()
         )
         if not relevant:
@@ -232,35 +339,45 @@ def evaluate_hybrid(train_ratings, test_ratings,
             skipped += 1
             continue
 
-        # convert titles back to movieIds
-        rec_ids = []
-        for r in recs:
-            row = movies_df[
-                movies_df['title'] == r['title']
-            ]['movieId'].values
-            if len(row) > 0:
-                rec_ids.append(int(row[0]))
+        rec_ids = [r['movieId'] for r in recs]
 
         if not rec_ids:
             skipped += 1
             continue
 
+        all_recommended.update(rec_ids[:k])
+
         precisions.append(precision_at_k(rec_ids, relevant, k))
         recalls.append(recall_at_k(rec_ids, relevant, k))
         ndcgs.append(ndcg_at_k(rec_ids, relevant, k))
         diversities.append(diversity_score(recs, tmdb_df))
+        hit_rates.append(hit_rate_at_k(rec_ids, relevant, k))
+        maps.append(average_precision_at_k(rec_ids, relevant, k))
+        mrrs.append(mrr_at_k(rec_ids, relevant, k))
 
     print(f"  Evaluated: {len(precisions)} | Skipped: {skipped}")
+
+    coverage = (
+        len(all_recommended)
+        / movies_df['movieId'].nunique()
+    )
 
     return {
         f'Hybrid Precision@{k}':  round(np.mean(precisions), 4)
                                    if precisions else 0,
         f'Hybrid Recall@{k}':     round(np.mean(recalls), 4)
                                    if recalls else 0,
+        f'Hybrid Hit Rate@{k}':   round(np.mean(hit_rates), 4)
+                                   if hit_rates else 0,
         f'Hybrid NDCG@{k}':       round(np.mean(ndcgs), 4)
                                    if ndcgs else 0,
+        f'MAP@{k}':               round(np.mean(maps), 4)
+                                   if maps else 0,
+        f'MRR@{k}':               round(np.mean(mrrs), 4)
+                                   if mrrs else 0,
         'Avg Diversity':           round(np.mean(diversities), 4)
                                    if diversities else 0,
+        'Coverage':                round(coverage, 4),
         'Users evaluated':         len(precisions)
     }
 
@@ -327,6 +444,12 @@ def evaluate_sentiment(imdb_df, n_samples=300):
         build_vader, vader_score,
         load_distilbert, distilbert_score
     )
+    from sklearn.metrics import (
+        accuracy_score,
+        precision_score,
+        recall_score,
+        f1_score
+    )
 
     sample   = imdb_df.sample(n=n_samples, random_state=42)
     analyzer = build_vader()
@@ -339,20 +462,37 @@ def evaluate_sentiment(imdb_df, n_samples=300):
 
     try:
         model, tokenizer = load_distilbert()
-        db_correct = sum(
-            1 for _, row in sample.iterrows()
-            if (1 if distilbert_score(
+        y_true = []
+        y_pred = []
+        for _, row in sample.iterrows():
+            prediction = (
+                1
+                if distilbert_score(
                     row['review'], model, tokenizer
-                ) > 0.5 else 0) == row['label']
-        )
-        db_acc = round(db_correct / n_samples, 4)
+                ) > 0.5
+                else 0
+            )
+            y_true.append(row['label'])
+            y_pred.append(prediction)
+
+        db_results = {
+            'DistilBERT accuracy':  round(accuracy_score(y_true, y_pred), 4),
+            'DistilBERT precision': round(precision_score(y_true, y_pred), 4),
+            'DistilBERT recall':    round(recall_score(y_true, y_pred), 4),
+            'DistilBERT F1':        round(f1_score(y_true, y_pred), 4),
+        }
     except Exception as e:
-        db_acc = 'N/A'
         print(f"  ⚠ DistilBERT skipped: {e}")
+        db_results = {
+            'DistilBERT accuracy':  'N/A',
+            'DistilBERT precision': 'N/A',
+            'DistilBERT recall':    'N/A',
+            'DistilBERT F1':        'N/A',
+        }
 
     return {
-        'VADER accuracy':      round(vader_correct / n_samples, 4),
-        'DistilBERT accuracy': db_acc
+        'VADER accuracy': round(vader_correct / n_samples, 4),
+        **db_results
     }
 
 
@@ -393,7 +533,7 @@ def evaluate_sentiment(imdb_df, n_samples=300):
             relevant = set(
                 test_ratings[
                     (test_ratings['userId'] == user_id) &
-                    (test_ratings['rating'] >= 4.0)
+                    (test_ratings['rating'] >= 3.5)
                 ]['movieId'].tolist()
             )
             if not relevant:
@@ -412,13 +552,7 @@ def evaluate_sentiment(imdb_df, n_samples=300):
                     alpha=alpha, beta=beta, gamma=gamma,
                     n=20
                 )
-                rec_ids = []
-                for r in recs:
-                    row = movies_df[
-                        movies_df['title'] == r['title']
-                    ]['movieId'].values
-                    if len(row) > 0:
-                        rec_ids.append(int(row[0]))
+                rec_ids = [r['movieId'] for r in recs]
                 if rec_ids:
                     ndcgs.append(
                         ndcg_at_k(rec_ids, relevant, 10)
@@ -470,6 +604,89 @@ def evaluate_sentiment(imdb_df, n_samples=300):
     print("  ✓ Saved to models/optimal_weights.json")
 
     return best_weights, results_df  """
+
+
+# ══════════════════════════════════════════════════════════════
+# SANITY BASELINE — random recommender
+# ══════════════════════════════════════════════════════════════
+
+def random_recommend(movies_df, k=10):
+    return list(
+        np.random.choice(
+            movies_df['movieId'],
+            k,
+            replace=False
+        )
+    )
+
+
+def evaluate_random_baseline(test_ratings, movies_df,
+                              n_users=50, k=10):
+    """
+    Evaluates a random recommender as a sanity check.
+    Expected result: Precision@K ≈ 0, NDCG@K ≈ 0.
+    If your real model doesn't beat this, something is wrong.
+    """
+    print(f"\nEvaluating Random Baseline (n_users={n_users}, k={k})...")
+
+    rng        = np.random.default_rng(42)
+    test_users = rng.choice(
+        test_ratings['userId'].unique(),
+        size=min(n_users, test_ratings['userId'].nunique()),
+        replace=False
+    )
+
+    precisions = []
+    ndcgs      = []
+
+    for user_id in test_users:
+        relevant = set(
+            test_ratings[
+                (test_ratings['userId'] == user_id) &
+                (test_ratings['rating'] >= 3.5)
+            ]['movieId'].tolist()
+        )
+        if not relevant:
+            continue
+
+        rec_ids = random_recommend(movies_df, k)
+        precisions.append(precision_at_k(rec_ids, relevant, k))
+        ndcgs.append(ndcg_at_k(rec_ids, relevant, k))
+
+    return {
+        f'Random Precision@{k}': round(np.mean(precisions), 4)
+                                  if precisions else 0,
+        f'Random NDCG@{k}':      round(np.mean(ndcgs), 4)
+                                  if ndcgs else 0,
+        'Users evaluated':        len(precisions)
+    }
+
+
+# ══════════════════════════════════════════════════════════════
+# LEAKAGE CHECK
+# ══════════════════════════════════════════════════════════════
+
+def check_train_test_leakage(train_ratings, test_ratings):
+    """
+    Verifies the train/test split has zero (user, movie) overlap.
+    Any overlap means the model could be evaluated on data it
+    was trained on — inflating every metric.
+    Should print: Leakage check: 0 overlaps
+    """
+    train_pairs = set(
+        zip(train_ratings['userId'], train_ratings['movieId'])
+    )
+    test_pairs = set(
+        zip(test_ratings['userId'], test_ratings['movieId'])
+    )
+    overlap = train_pairs & test_pairs
+    print(f"Leakage check: {len(overlap)} overlaps")
+    if len(overlap) > 0:
+        print(f"  ⚠ WARNING: {len(overlap)} (user, movie) pairs "
+              f"appear in both train and test sets!")
+    else:
+        print("  ✓ No leakage detected")
+    return len(overlap)
 
 
 def print_report(title, results):
@@ -533,6 +750,9 @@ if __name__ == "__main__":
     print("\nSplitting ratings into train/test...")
     train_ratings, test_ratings = split_user_ratings(ratings)
 
+    # ── leakage check ─────────────────────────────────────────
+    check_train_test_leakage(train_ratings, test_ratings)
+
     # ── build collab on TRAIN data ────────────────────────────
     # ── build collab matrix on TRAIN data ─────────────────────────
 # used as fallback if cluster model unavailable
@@ -574,7 +794,13 @@ if __name__ == "__main__":
     )
     print_report("FULL HYBRID SYSTEM", hybrid_results)
 
-    # ── 5. weight optimization ────────────────────────────────
+    # ── 5. random baseline ────────────────────────────────────
+    random_results = evaluate_random_baseline(
+        test_ratings, movies, n_users=50, k=10
+    )
+    print_report("RANDOM BASELINE", random_results)
+
+    # ── 6. weight optimization ────────────────────────────────
     """ best_weights, _ = optimize_weights(
         user_movie_matrix, train_ratings,
         test_ratings, movies, tmdb_clean,
@@ -582,7 +808,7 @@ if __name__ == "__main__":
         search_df, svd_data
     ) """
 
-    # ── 6. final summary ──────────────────────────────────────
+    # ── 7. final summary ──────────────────────────────────────
     print("\n" + "="*55)
     print("  FINAL SUMMARY")
     print("="*55)
@@ -596,14 +822,19 @@ if __name__ == "__main__":
           f"{hybrid_results['Hybrid NDCG@10']}")
     print(f"  Hybrid Diversity           : "
           f"{hybrid_results['Avg Diversity']}")
+    print(f"  Hybrid Coverage            : "
+          f"{hybrid_results['Coverage']}")
+    print(f"  Random Precision@10        : "
+          f"{random_results['Random Precision@10']}")
+    print(f"  Random NDCG@10             : "
+          f"{random_results['Random NDCG@10']}")
     print(f"  Content Genre Overlap      : "
           f"{content_results['Genre overlap@K']}")
     print(f"  VADER Accuracy             : "
           f"{sentiment_results['VADER accuracy']}")
     print(f"  DistilBERT Accuracy        : "
           f"{sentiment_results['DistilBERT accuracy']}")
-   # print(f"  Optimal Weights            : "
-        #  f"α={best_weights[0]} β={best_weights[1]} "
-         # f"γ={best_weights[2]}")
+    print(f"  DistilBERT F1              : "
+          f"{sentiment_results['DistilBERT F1']}")
     print("="*55)
     print("\n✓ Evaluation complete!")

@@ -8,7 +8,14 @@ import math
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 # ── paths ──────────────────────────────────────────────────────
-DATA_RAW = Path("data/raw")
+DATA_RAW  = Path("data/raw")
+MODEL_DIR = Path("models/distilbert_sentiment")
+
+# The split index is fixed so train and eval NEVER overlap.
+# 5000 train  ·  1000 val  ·  remainder (~43 000) = eval pool
+_TRAIN_END = 5000
+_VAL_END   = 6000   # indices [5000, 6000) are validation
+# evaluate.py samples from indices [6000, …) — never seen during training
 
 
 # ══════════════════════════════════════════════════════════════
@@ -16,12 +23,8 @@ DATA_RAW = Path("data/raw")
 # ══════════════════════════════════════════════════════════════
 
 def clean_review(text):
-    """
-    Remove HTML tags and extra whitespace from reviews.
-    IMDB reviews contain <br /> tags we need to strip.
-    """
-    text = re.sub(r'<[^>]+>', ' ', text)   # remove HTML
-    text = re.sub(r'\s+', ' ', text)        # collapse whitespace
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
 
@@ -29,74 +32,67 @@ def load_imdb():
     path = DATA_RAW / "imdb" / "IMDB Dataset.csv"
     df   = pd.read_csv(path)
     df['review'] = df['review'].apply(clean_review)
-    # convert sentiment to numeric: positive=1, negative=0
     df['label']  = (df['sentiment'] == 'positive').astype(int)
     print(f"✓ IMDB loaded and cleaned: {df.shape}")
     return df
 
 
+def get_imdb_splits(df):
+    """
+    Return (train_df, val_df, eval_df) with guaranteed zero overlap.
+
+    Uses a fixed seed shuffle so splits are reproducible across
+    all scripts, but the seed is applied ONCE here — not scattered
+    across load_imdb / train / evaluate calls.
+
+    train : rows [0,      _TRAIN_END)  → fine-tuning only
+    val   : rows [_TRAIN_END, _VAL_END) → used during training loop
+    eval  : rows [_VAL_END,  end)       → evaluate.py samples from here
+    """
+    shuffled  = df.sample(frac=1, random_state=0).reset_index(drop=True)
+    train_df  = shuffled.iloc[:_TRAIN_END].copy()
+    val_df    = shuffled.iloc[_TRAIN_END:_VAL_END].copy()
+    eval_df   = shuffled.iloc[_VAL_END:].copy()
+    print(f"✓ IMDB split → train={len(train_df):,}  "
+          f"val={len(val_df):,}  eval={len(eval_df):,}")
+    return train_df, val_df, eval_df
+
+
 # ══════════════════════════════════════════════════════════════
-# 1. VADER — RULE-BASED SENTIMENT (fast, no training)
+# 1. VADER
 # ══════════════════════════════════════════════════════════════
 
 def build_vader():
-    """
-    VADER returns 4 scores for any text:
-      neg      — proportion of negative sentiment  (0 to 1)
-      neu      — proportion of neutral sentiment   (0 to 1)
-      pos      — proportion of positive sentiment  (0 to 1)
-      compound — overall score from -1.0 to +1.0
-                 > 0.05  = positive
-                 < -0.05 = negative
-                 else    = neutral
-    We use compound as our sentiment score.
-    """
     analyzer = SentimentIntensityAnalyzer()
     print("✓ VADER analyzer ready")
     return analyzer
 
 
 def vader_score(text, analyzer):
-    """Score a single review. Returns compound score -1 to +1."""
-    scores = analyzer.polarity_scores(text)
-    return scores['compound']
+    return analyzer.polarity_scores(text)['compound']
 
 
 def vader_score_list(reviews, analyzer):
-    """
-    Score a list of reviews and return the mean compound score.
-    This is what we use to score a movie — average over all its reviews.
-    """
     if not reviews:
         return 0.0
-    scores = [vader_score(r, analyzer) for r in reviews]
-    return float(np.mean(scores))
+    return float(np.mean([vader_score(r, analyzer) for r in reviews]))
 
 
 def evaluate_vader(df, analyzer, sample=500):
-    """
-    Test VADER accuracy on a sample of IMDB reviews.
-    Compound > 0 = predicted positive, label=1 = actually positive.
-    """
-    sample_df = df.sample(n=sample, random_state=42)
-    correct   = 0
-
-    for _, row in sample_df.iterrows():
-        score     = vader_score(row['review'], analyzer)
-        predicted = 1 if score > 0 else 0
-        if predicted == row['label']:
-            correct += 1
-
-    accuracy = correct / sample
-    print(f"✓ VADER accuracy on {sample} IMDB reviews: "
-          f"{accuracy:.1%}")
+    sample_df = df.sample(n=min(sample, len(df)), random_state=1)
+    correct   = sum(
+        1 for _, row in sample_df.iterrows()
+        if (1 if vader_score(row['review'], analyzer) > 0 else 0)
+           == row['label']
+    )
+    accuracy = correct / len(sample_df)
+    print(f"✓ VADER accuracy on {len(sample_df)} IMDB reviews: {accuracy:.1%}")
     return accuracy
 
 
 # ══════════════════════════════════════════════════════════════
-# 2. RE-RANKER — adjust hybrid scores using sentiment
+# 2. RE-RANKER
 # ══════════════════════════════════════════════════════════════
-
 
 def rerank_with_sentiment(hybrid_recs, analyzer,
                            tmdb_df=None,
@@ -105,31 +101,8 @@ def rerank_with_sentiment(hybrid_recs, analyzer,
                            hybrid_weight=0.70,
                            tmdb_weight=0.15,
                            distilbert_weight=0.15):
-    """
-    Re-ranks recommendations using a three-component scoring formula:
-
-        final_score = 0.70 × hybrid_score
-                    + 0.15 × tmdb_score
-                    + 0.15 × distilbert_score
-
-    tmdb_score
-        Derived from TMDB vote_average and vote_count.
-        tmdb_score = (vote_average / 10) × confidence
-        confidence = log10(vote_count + 1) / 5, capped at 1.0
-        Default = 0.5 when TMDB data is unavailable.
-
-    distilbert_score
-        Probability of positive sentiment (0–1) from the
-        fine-tuned DistilBERT model run on the movie's overview.
-        Falls back to VADER compound score (mapped 0–1) if the
-        DistilBERT model is not loaded.
-        Default = 0.5 when no text is available.
-
-    Weights must sum to 1.0. The defaults (0.70 / 0.15 / 0.15)
-    can be overridden via the parameters.
-    """
     assert abs(hybrid_weight + tmdb_weight + distilbert_weight - 1.0) < 1e-6, \
-        "hybrid_weight + tmdb_weight + distilbert_weight must equal 1.0"
+        "weights must sum to 1.0"
 
     print(f"\nRe-ranking {len(hybrid_recs)} recommendations "
           f"(hybrid={hybrid_weight}, tmdb={tmdb_weight}, "
@@ -137,68 +110,39 @@ def rerank_with_sentiment(hybrid_recs, analyzer,
 
     results = []
     for rec in hybrid_recs:
-        title = rec['title']
-
-        # ── 1. TMDB score (vote quality × popularity confidence) ──
-        tmdb_score = 0.5  # neutral default
-
-        overview_text = ''  # collect for DistilBERT below
+        title        = rec['title']
+        tmdb_score   = 0.5
+        overview_text = ''
 
         if tmdb_df is not None:
-            # exact title match
-            row = tmdb_df[
-                tmdb_df['title'].str.lower() == title.lower()
-            ]
-            # fallback: strip year suffix e.g. "Toy Story (1995)"
+            row = tmdb_df[tmdb_df['title'].str.lower() == title.lower()]
             if len(row) == 0:
                 clean = re.sub(r'\s*\(\d{4}\)\s*$', '',
                                title).strip().lower()
-                row = tmdb_df[
-                    tmdb_df['title'].str.lower() == clean
-                ]
+                row = tmdb_df[tmdb_df['title'].str.lower() == clean]
 
             if len(row) > 0:
                 r          = row.iloc[0]
                 vote_avg   = float(r.get('vote_average', 5) or 5)
                 vote_count = float(r.get('vote_count',   0) or 0)
-
-                # normalise vote_average 0-10 → 0-1
-                quality = vote_avg / 10.0
-
-                # log-scale confidence: rewards volume without
-                # letting blockbusters dominate completely
-                confidence = min(
-                    math.log10(vote_count + 1) / 5.0, 1.0
-                )
-
+                quality    = vote_avg / 10.0
+                confidence = min(math.log10(vote_count + 1) / 5.0, 1.0)
                 tmdb_score = round(quality * confidence, 4)
-
-                # grab overview for DistilBERT
                 overview_text = str(r.get('overview', '') or '')
 
-        # ── 2. DistilBERT sentiment score ─────────────────────────
-        db_score = 0.5  # neutral default
-
+        db_score = 0.5
         if overview_text:
-            if distilbert_model is not None and \
-               distilbert_tokenizer is not None:
-                # use fine-tuned DistilBERT on movie overview
+            if distilbert_model is not None and distilbert_tokenizer is not None:
                 try:
                     db_score = distilbert_score(
-                        overview_text,
-                        distilbert_model,
-                        distilbert_tokenizer
+                        overview_text, distilbert_model, distilbert_tokenizer
                     )
                 except Exception:
                     db_score = 0.5
             else:
-                # fallback: VADER compound mapped from [-1,1] → [0,1]
-                compound = analyzer.polarity_scores(
-                    overview_text
-                )['compound']
+                compound = analyzer.polarity_scores(overview_text)['compound']
                 db_score = round((compound + 1) / 2, 4)
 
-        # ── 3. Weighted final score ────────────────────────────────
         final_score = round(
             hybrid_weight     * rec['hybrid_score'] +
             tmdb_weight       * tmdb_score          +
@@ -207,40 +151,29 @@ def rerank_with_sentiment(hybrid_recs, analyzer,
         )
 
         results.append({
-            'title':             rec['title'],
-            'hybrid_score':      rec['hybrid_score'],
-            'tmdb_score':        tmdb_score,
-            'distilbert_score':  round(db_score, 4),
-            'sentiment_score':   round(db_score, 4),  # kept for dashboard compatibility
-            'final_score':       final_score
+            'title':            rec['title'],
+            'hybrid_score':     rec['hybrid_score'],
+            'tmdb_score':       tmdb_score,
+            'distilbert_score': round(db_score, 4),
+            'sentiment_score':  round(db_score, 4),
+            'final_score':      final_score
         })
 
     results.sort(key=lambda x: x['final_score'], reverse=True)
     return results
+
+
 # ══════════════════════════════════════════════════════════════
-# MAIN — test VADER pipeline
-# ══════════════════════════════════════════════════════════════
-# ══════════════════════════════════════════════════════════════
-# 3. DISTILBERT — FINE-TUNED SENTIMENT MODEL
+# 3. DISTILBERT
 # ══════════════════════════════════════════════════════════════
 import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import (DistilBertTokenizerFast,
                           DistilBertForSequenceClassification)
 from torch.optim import AdamW
-from pathlib import Path
-
-MODEL_DIR = Path("models/distilbert_sentiment")
 
 
 class IMDBDataset(Dataset):
-    """
-    PyTorch Dataset wrapper around our IMDB dataframe.
-    Tokenizes reviews on the fly during training.
-
-    __len__  tells PyTorch how many samples we have
-    __getitem__ returns one tokenized sample by index
-    """
     def __init__(self, texts, labels, tokenizer, max_length=256):
         self.texts     = texts
         self.labels    = labels
@@ -253,53 +186,39 @@ class IMDBDataset(Dataset):
     def __getitem__(self, idx):
         encoding = self.tokenizer(
             self.texts[idx],
-            truncation=True,       # cut reviews longer than max_length
-            padding='max_length',  # pad shorter reviews with zeros
+            truncation=True,
+            padding='max_length',
             max_length=self.max_len,
-            return_tensors='pt'    # return PyTorch tensors
+            return_tensors='pt'
         )
         return {
             'input_ids':      encoding['input_ids'].squeeze(),
             'attention_mask': encoding['attention_mask'].squeeze(),
-            'label':          torch.tensor(self.labels[idx],
-                                           dtype=torch.long)
+            'label':          torch.tensor(self.labels[idx], dtype=torch.long)
         }
 
 
-def train_distilbert(df, epochs=2, batch_size=16, max_length=256,
-                     train_size=5000, val_size=1000):
+def train_distilbert(df, epochs=2, batch_size=16, max_length=256):
     """
-    Fine-tune DistilBERT for binary sentiment classification.
-
-    We use 5000 training samples and 1000 validation samples —
-    enough to get 90%+ accuracy without needing a GPU or hours of time.
-
-    The model learns to map review text → positive(1) / negative(0).
+    Fine-tune DistilBERT using the fixed train/val split from
+    get_imdb_splits().  The eval split is never touched here.
     """
+    train_df, val_df, _ = get_imdb_splits(df)   # eval split ignored
+
     print("\nFine-tuning DistilBERT...")
-    print(f"  Train: {train_size} | Val: {val_size} | "
+    print(f"  Train: {len(train_df):,} | Val: {len(val_df):,} | "
           f"Epochs: {epochs} | Batch: {batch_size}")
 
-    # check if GPU is available (much faster if so)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"  Device: {device}")
 
-    # ── load tokenizer and model ───────────────────────────────
-    print("  Loading DistilBERT tokenizer and model...")
     tokenizer = DistilBertTokenizerFast.from_pretrained(
         'distilbert-base-uncased'
     )
     model = DistilBertForSequenceClassification.from_pretrained(
-        'distilbert-base-uncased',
-        num_labels=2       # binary: positive or negative
+        'distilbert-base-uncased', num_labels=2
     )
     model.to(device)
-
-    # ── prepare data ───────────────────────────────────────────
-    # shuffle and split
-    df_shuffled = df.sample(frac=1, random_state=42).reset_index(drop=True)
-    train_df    = df_shuffled[:train_size]
-    val_df      = df_shuffled[train_size:train_size + val_size]
 
     train_dataset = IMDBDataset(
         train_df['review'].tolist(),
@@ -312,18 +231,12 @@ def train_distilbert(df, epochs=2, batch_size=16, max_length=256,
         tokenizer, max_length
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size,
-                              shuffle=True)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader   = DataLoader(val_dataset,   batch_size=batch_size)
 
-    # ── optimizer ──────────────────────────────────────────────
-    # AdamW is the standard optimizer for transformer fine-tuning
-    # lr=2e-5 is the standard learning rate for DistilBERT fine-tuning
     optimizer = AdamW(model.parameters(), lr=2e-5)
 
-    # ── training loop ──────────────────────────────────────────
     for epoch in range(epochs):
-        # ── train ──
         model.train()
         total_loss = 0
         correct    = 0
@@ -334,19 +247,16 @@ def train_distilbert(df, epochs=2, batch_size=16, max_length=256,
             attention_mask = batch['attention_mask'].to(device)
             labels         = batch['label'].to(device)
 
-            # forward pass
             outputs = model(input_ids=input_ids,
-                           attention_mask=attention_mask,
-                           labels=labels)
-            loss    = outputs.loss
-            logits  = outputs.logits
+                            attention_mask=attention_mask,
+                            labels=labels)
+            loss   = outputs.loss
+            logits = outputs.logits
 
-            # backward pass
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            # track metrics
             total_loss += loss.item()
             preds       = torch.argmax(logits, dim=1)
             correct    += (preds == labels).sum().item()
@@ -358,7 +268,6 @@ def train_distilbert(df, epochs=2, batch_size=16, max_length=256,
                       f"Loss: {total_loss/(batch_idx+1):.4f} | "
                       f"Train Acc: {correct/total:.1%}")
 
-        # ── validate ──
         model.eval()
         val_correct = 0
         val_total   = 0
@@ -370,26 +279,22 @@ def train_distilbert(df, epochs=2, batch_size=16, max_length=256,
                 labels         = batch['label'].to(device)
 
                 outputs = model(input_ids=input_ids,
-                               attention_mask=attention_mask)
+                                attention_mask=attention_mask)
                 preds   = torch.argmax(outputs.logits, dim=1)
                 val_correct += (preds == labels).sum().item()
                 val_total   += labels.size(0)
 
         val_acc = val_correct / val_total
-        print(f"\n  ✓ Epoch {epoch+1} complete | "
-              f"Val Accuracy: {val_acc:.1%}\n")
+        print(f"\n  ✓ Epoch {epoch+1} complete | Val Accuracy: {val_acc:.1%}\n")
 
-    # ── save model ─────────────────────────────────────────────
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(MODEL_DIR)
     tokenizer.save_pretrained(MODEL_DIR)
     print(f"✓ DistilBERT saved to {MODEL_DIR}")
-
     return model, tokenizer
 
 
 def load_distilbert():
-    """Load the fine-tuned model from disk."""
     device    = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     tokenizer = DistilBertTokenizerFast.from_pretrained(MODEL_DIR)
     model     = DistilBertForSequenceClassification.from_pretrained(MODEL_DIR)
@@ -400,10 +305,7 @@ def load_distilbert():
 
 
 def distilbert_score(text, model, tokenizer, max_length=256):
-    """
-    Score a single review using the fine-tuned model.
-    Returns probability of positive sentiment (0 to 1).
-    """
+    """Returns probability of positive sentiment (0–1)."""
     device   = next(model.parameters()).device
     encoding = tokenizer(
         text,
@@ -416,16 +318,15 @@ def distilbert_score(text, model, tokenizer, max_length=256):
     attention_mask = encoding['attention_mask'].to(device)
 
     with torch.no_grad():
-        outputs = model(input_ids=input_ids,
-                       attention_mask=attention_mask)
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
         probs   = torch.softmax(outputs.logits, dim=1)
-        # probs[0][1] = probability of class 1 (positive)
         return float(probs[0][1])
 
 
 def evaluate_distilbert(df, model, tokenizer, sample=200):
-    """Test DistilBERT accuracy on a sample of IMDB reviews."""
-    sample_df = df.sample(n=sample, random_state=99)
+    """Test on held-out eval split only — never touches train/val rows."""
+    _, _, eval_df = get_imdb_splits(df)
+    sample_df = eval_df.sample(n=min(sample, len(eval_df)), random_state=2)
     correct   = 0
 
     for _, row in sample_df.iterrows():
@@ -434,9 +335,14 @@ def evaluate_distilbert(df, model, tokenizer, sample=200):
         if predicted == row['label']:
             correct += 1
 
-    accuracy = correct / sample
-    print(f"✓ DistilBERT accuracy on {sample} reviews: {accuracy:.1%}")
+    accuracy = correct / len(sample_df)
+    print(f"✓ DistilBERT accuracy on {len(sample_df)} held-out reviews: {accuracy:.1%}")
     return accuracy
+
+
+# ══════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     print("=" * 55)
@@ -446,7 +352,6 @@ if __name__ == "__main__":
     imdb     = load_imdb()
     analyzer = build_vader()
 
-    # test on a few raw reviews
     print("\n--- VADER on sample reviews ---")
     for i in range(3):
         review = imdb['review'].iloc[i]
@@ -457,55 +362,12 @@ if __name__ == "__main__":
         print(f"  Actual label   : {actual}")
         print(f"  VADER predicted: {'positive' if score > 0 else 'negative'}")
 
-    # evaluate accuracy
-    print("\n--- VADER accuracy on 500 IMDB reviews ---")
-    evaluate_vader(imdb, analyzer, sample=500)
+    print("\n--- VADER accuracy ---")
+    _, _, eval_df = get_imdb_splits(imdb)
+    evaluate_vader(eval_df, analyzer, sample=500)
 
-    # simulate re-ranking
-    print("\n--- Simulated re-ranking ---")
-    dummy_recs = [
-        {'title': 'Toy Story (1995)',          'hybrid_score': 0.4775},
-        {'title': 'Hangover, The (2009)',       'hybrid_score': 0.3750},
-        {'title': 'X2: X-Men United (2003)',    'hybrid_score': 0.3500},
-        {'title': 'Matrix, The (1999)',         'hybrid_score': 0.2844},
-        {'title': 'Star Wars Ep VI (1983)',     'hybrid_score': 0.3000},
-    ]
+    print("\n--- DistilBERT fine-tuning ---")
+    model, tokenizer = train_distilbert(imdb, epochs=2, batch_size=16)
 
-    reranked = rerank_with_sentiment(dummy_recs, analyzer,
-                                      sentiment_weight=0.2)
-
-    print(f"\n{'Rank':<5} {'Title':<35} "
-          f"{'Hybrid':>8} {'Sentiment':>10} {'Final':>8}")
-    print("-" * 70)
-    for i, r in enumerate(reranked, 1):
-        print(f"  {i:<4} {r['title']:<35} "
-              f"{r['hybrid_score']:>8.4f} "
-              f"{r['sentiment_score']:>10.4f} "
-              f"{r['final_score']:>8.4f}")
-    # ── DistilBERT training ────────────────────────────────────
-    print("\n" + "=" * 55)
-    print("PHASE 4.2 — Fine-tuning DistilBERT")
-    print("=" * 55)
-
-    model, tokenizer = train_distilbert(
-        imdb,
-        epochs=2,
-        batch_size=16,
-        train_size=5000,
-        val_size=1000
-    )
-
-    # test on a few reviews
-    print("\n--- DistilBERT on sample reviews ---")
-    for i in range(3):
-        review = imdb['review'].iloc[i]
-        score  = distilbert_score(review, model, tokenizer)
-        actual = imdb['sentiment'].iloc[i]
-        print(f"\n  Snippet   : {review[:80]}...")
-        print(f"  DB score  : {score:.4f}  "
-              f"({'positive' if score > 0.5 else 'negative'})")
-        print(f"  Actual    : {actual}")
-
-    # evaluate
-    print("\n--- DistilBERT accuracy ---")
-    evaluate_distilbert(imdb, model, tokenizer, sample=200)
+    print("\n--- DistilBERT accuracy on held-out eval set ---")
+    evaluate_distilbert(imdb, model, tokenizer, sample=300)

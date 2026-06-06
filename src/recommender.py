@@ -795,37 +795,65 @@ def hybrid_recommend(user_id, user_movie_matrix, ratings_df,
     svd_recs     = normalize_scores(svd_recs,      'predicted_rating')
     content_recs = normalize_scores(content_recs,  'similarity_score')
 
-    combined = {}
+    print("Collab:", collab_recs[:3])
+    print("SVD:", svd_recs[:3])
+    print("Content:", content_recs[:3])
+
+    combined = {}  # movieId -> score
 
     for r in collab_recs:
-        t = movies_df[
-            movies_df['movieId'] == r['movieId']
-        ]['title'].values
-        if len(t) == 0:
-            continue
-        combined[t[0]] = (combined.get(t[0], 0)
-                          + alpha * r['normalized_score'])
+        mid = r['movieId']
+        combined[mid] = (
+            combined.get(mid, 0)
+            + alpha * r['normalized_score']
+        )
 
     for r in svd_recs:
-        combined[r['title']] = (combined.get(r['title'], 0)
-                                + gamma * r['normalized_score'])
+        row = movies_df[movies_df['title'] == r['title']]
+        if len(row) == 0:
+            continue
+        mid = int(row.iloc[0]['movieId'])
+        combined[mid] = (
+            combined.get(mid, 0)
+            + gamma * r['normalized_score']
+        )
 
     for r in content_recs:
-        combined[r['title']] = (combined.get(r['title'], 0)
-                                + beta * r['normalized_score'])
+        row = movies_df[movies_df['title'] == r['title']]
+        if len(row) == 0:
+            continue
+        mid = int(row.iloc[0]['movieId'])
+        combined[mid] = (
+            combined.get(mid, 0)
+            + beta * r['normalized_score']
+        )
 
-    seen_ids = ratings_df[
-        ratings_df['userId'] == user_id
-    ]['movieId'].tolist()
+    seen_ids = set(
+        ratings_df[ratings_df['userId'] == user_id]['movieId']
+    )
     for mid in seen_ids:
-        t = movies_df[movies_df['movieId'] == mid]['title'].values
-        if len(t) > 0:
-            combined.pop(t[0], None)
+        combined.pop(mid, None)
 
-    ranked = sorted(combined.items(),
-                    key=lambda x: x[1], reverse=True)
-    return [{'title': t, 'hybrid_score': round(s, 4)}
-            for t, s in ranked[:n]]
+    movie_lookup = (
+        movies_df
+        .set_index('movieId')['title']
+        .to_dict()
+    )
+
+    ranked = sorted(
+        combined.items(),
+        key=lambda x: x[1],
+        reverse=True
+    )
+
+    results = []
+    for mid, score in ranked[:n]:
+        results.append({
+            'movieId':     int(mid),
+            'title':       movie_lookup.get(mid, ''),
+            'hybrid_score': round(score, 4)
+        })
+    return results
 
 
 # ══════════════════════════════════════════════════════════════
