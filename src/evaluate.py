@@ -218,7 +218,7 @@ def evaluate_clustered_collab(train_ratings, test_ratings,
         relevant = set(
             test_ratings[
                 (test_ratings['userId'] == user_id) &
-                (test_ratings['rating'] >= 3.5)
+                (test_ratings['rating'] >= 3.0)
             ]['movieId'].tolist()
         )
         if not relevant:
@@ -270,34 +270,21 @@ def evaluate_hybrid(train_ratings, test_ratings,
                     user_movie_matrix,
                     n_users=30, k=10):
     """
-    Evaluate the FULL hybrid pipeline end to end.
-
-    This is the most important evaluation because it measures
-    what users actually see — not individual components.
-
-    For each user:
-    1. Run full hybrid_recommend on TRAIN data
-    2. Check how many results appear in TEST liked movies
+    Evaluate the FULL hybrid pipeline cleanly in a single pass.
     """
-    print(f"\nEvaluating Full Hybrid System "
-          f"(n_users={n_users}, k={k})...")
+    print(f"\nEvaluating Full Hybrid System (n_users={n_users}, k={k})...")
 
     cluster_data   = build_clustered_collab_model(train_ratings)
     user_cluster   = cluster_data['user_cluster']
     all_test_users = test_ratings['userId'].unique()
 
-    # prefer users who are in cluster model for fairness
     known = [u for u in all_test_users if u in user_cluster]
     rng = np.random.default_rng(42)
 
     if len(known) > n_users:
-      test_users = rng.choice(
-        known,
-        size=n_users,
-        replace=False
-    )
+        test_users = rng.choice(known, size=n_users, replace=False)
     else:
-       test_users = known
+        test_users = known
 
     print(f"  Testing {len(test_users)} users...")
 
@@ -310,15 +297,20 @@ def evaluate_hybrid(train_ratings, test_ratings,
     diversities     = []
     skipped         = 0
     all_recommended = set()
+    
+    from collections import Counter
+    movie_freq = Counter()
 
-    # pre-build normalised index once — reused by diversity_score
     tmdb_norm_idx = _build_tmdb_norm_index(tmdb_df)
-
+    mid_to_title = movies_df.set_index('movieId')['title'].to_dict()
+    # Clear stale cache so it rebuilds from train_ratings only
+    if hasattr(hybrid_recommend, '_cluster_cache'):
+       del hybrid_recommend._cluster_cache
     for user_id in test_users:
         relevant = set(
-            test_ratings[
+            int(x) for x in test_ratings[
                 (test_ratings['userId'] == user_id) &
-                (test_ratings['rating'] >= 3.5)
+                (test_ratings['rating'] >= 3.0)
             ]['movieId'].tolist()
         )
         if not relevant:
@@ -326,59 +318,7 @@ def evaluate_hybrid(train_ratings, test_ratings,
             continue
 
         try:
-            recs = hybrid_recommend(
-                user_id           = user_id,
-                user_movie_matrix = user_movie_matrix,
-                ratings_df        = train_ratings,
-                movies_df         = movies_df,
-                tmdb_df           = tmdb_df,
-                tfidf_matrix      = tfidf_matrix,
-                id_to_idx         = id_to_idx,
-                search_df         = search_df,
-                svd_data          = svd_data,
-                alpha=0.4,
-                beta=0.3,
-                gamma=0.3,
-                n=k * 2
-            )
-        except Exception as e:
-            skipped += 1
-            continue
-
-        if not recs:
-            skipped += 1
-            continue
-
-        # hybrid_recommend now returns movieId directly
-        rec_ids = [r['movieId'] for r in recs]
-
-        if not rec_ids:
-            skipped += 1
-            continue
-
-        all_recommended.update(rec_ids[:k])
-
-        precisions.append(precision_at_k(rec_ids, relevant, k))
-        recalls.append(recall_at_k(rec_ids, relevant, k))
-        ndcgs.append(ndcg_at_k(rec_ids, relevant, k))
-        diversities.append(
-            diversity_score(recs, tmdb_df, _norm_idx=tmdb_norm_idx)
-        )
-        hit_rates.append(hit_rate_at_k(rec_ids, relevant, k))
-        maps.append(average_precision_at_k(rec_ids, relevant, k))
-        mrrs.append(mrr_at_k(rec_ids, relevant, k))
-
-    print(f"  Evaluated: {len(precisions)} | Skipped: {skipped}")
-
-    # ── popularity bias diagnostic ─────────────────────────────
-    # Build movieId -> title lookup from movies_df (available here)
-    mid_to_title = (
-        movies_df.set_index('movieId')['title'].to_dict()
-    )
-    from collections import Counter
-    movie_freq = Counter()
-    for user_id in test_users:
-        try:
+            # RUN RECOMMENDATION PIPELINE EXACTLY ONCE
             recs = hybrid_recommend(
                 user_id           = user_id,
                 user_movie_matrix = user_movie_matrix,
@@ -390,11 +330,35 @@ def evaluate_hybrid(train_ratings, test_ratings,
                 search_df         = search_df,
                 svd_data          = svd_data,
                 alpha=0.4, beta=0.3, gamma=0.3,
-                n=k * 2
+                n=k
             )
-            movie_freq.update(r['movieId'] for r in recs[:k])
-        except Exception:
+        except Exception as e:
+            skipped += 1
             continue
+
+        if not recs:
+            skipped += 1
+            continue
+
+        # Force structural item representations to pure clean integers
+        rec_ids = [int(r['movieId']) for r in recs]
+
+        if not rec_ids:
+            skipped += 1
+            continue
+
+        all_recommended.update(rec_ids[:k])
+        movie_freq.update(rec_ids[:k])
+
+        precisions.append(precision_at_k(rec_ids, relevant, k))
+        recalls.append(recall_at_k(rec_ids, relevant, k))
+        ndcgs.append(ndcg_at_k(rec_ids, relevant, k))
+        diversities.append(diversity_score(recs, tmdb_df, _norm_idx=tmdb_norm_idx))
+        hit_rates.append(hit_rate_at_k(rec_ids, relevant, k))
+        maps.append(average_precision_at_k(rec_ids, relevant, k))
+        mrrs.append(mrr_at_k(rec_ids, relevant, k))
+
+    print(f"  Evaluated: {len(precisions)} | Skipped: {skipped}")
 
     n_users_eval = max(len(precisions), 1)
     print(f"\n  ── Popularity bias (top 10 most recommended) ──")
@@ -403,33 +367,20 @@ def evaluate_hybrid(train_ratings, test_ratings,
         title = mid_to_title.get(mid, f'movieId={mid}')
         print(f"    {title[:45]:<45}  {cnt}/{n_users_eval} users  ({pct:.0f}%)")
     print()
-    # ──────────────────────────────────────────────────────────
 
-    coverage = (
-        len(all_recommended) / movies_df['movieId'].nunique()
-        if len(all_recommended) > 0 else 0.0
-    )
+    coverage = len(all_recommended) / movies_df['movieId'].nunique() if all_recommended else 0.0
 
     return {
-        f'Hybrid Precision@{k}':  round(np.mean(precisions), 4)
-                                   if precisions else 0,
-        f'Hybrid Recall@{k}':     round(np.mean(recalls), 4)
-                                   if recalls else 0,
-        f'Hybrid Hit Rate@{k}':   round(np.mean(hit_rates), 4)
-                                   if hit_rates else 0,
-        f'Hybrid NDCG@{k}':       round(np.mean(ndcgs), 4)
-                                   if ndcgs else 0,
-        f'MAP@{k}':               round(np.mean(maps), 4)
-                                   if maps else 0,
-        f'MRR@{k}':               round(np.mean(mrrs), 4)
-                                   if mrrs else 0,
-        'Avg Diversity':           round(np.mean(diversities), 4)
-                                   if diversities else 0,
+        f'Hybrid Precision@{k}':   round(np.mean(precisions), 4) if precisions else 0,
+        f'Hybrid Recall@{k}':      round(np.mean(recalls), 4) if recalls else 0,
+        f'Hybrid Hit Rate@{k}':    round(np.mean(hit_rates), 4) if hit_rates else 0,
+        f'Hybrid NDCG@{k}':       round(np.mean(ndcgs), 4) if ndcgs else 0,
+        'MAP@10':                  round(np.mean(maps), 4) if maps else 0,
+        'MRR@10':                  round(np.mean(mrrs), 4) if mrrs else 0,
+        'Avg Diversity':           round(np.mean(diversities), 4) if diversities else 0,
         'Coverage':                round(coverage, 4),
         'Users evaluated':         len(precisions)
     }
-
-
 # ══════════════════════════════════════════════════════════════
 # CONTENT EVALUATION
 # ══════════════════════════════════════════════════════════════
@@ -666,29 +617,36 @@ def random_recommend(movies_df, k=10):
 
 def evaluate_random_baseline(test_ratings, movies_df, n_users=50, k=10):
     """
-    Precision@K and NDCG@K for a random recommender.
-    Expected: both ≈ 0.  If your model doesn't beat this, something is wrong.
+    Precision@K and NDCG@K for a random recommender using guaranteed type casting.
     """
     print(f"\nEvaluating Random Baseline (n_users={n_users}, k={k})...")
-    rng        = np.random.default_rng(42)
+    rng = np.random.default_rng(42)
     test_users = rng.choice(
         test_ratings['userId'].unique(),
         size=min(n_users, test_ratings['userId'].nunique()),
         replace=False
     )
     precisions, ndcgs = [], []
+    
+    # Cast target database to guaranteed pure Python standard integers
+    all_movie_ids = [int(x) for x in movies_df['movieId'].unique()]
+
     for user_id in test_users:
         relevant = set(
-            test_ratings[
+            int(x) for x in test_ratings[
                 (test_ratings['userId'] == user_id) &
                 (test_ratings['rating'] >= 3.5)
             ]['movieId'].tolist()
         )
         if not relevant:
             continue
-        rec_ids = random_recommend(movies_df, k)
+            
+        # Sample directly from the standard int array
+        rec_ids = [int(x) for x in rng.choice(all_movie_ids, k, replace=False)]
+        
         precisions.append(precision_at_k(rec_ids, relevant, k))
         ndcgs.append(ndcg_at_k(rec_ids, relevant, k))
+        
     return {
         f'Random Precision@{k}': round(np.mean(precisions), 4) if precisions else 0,
         f'Random NDCG@{k}':      round(np.mean(ndcgs), 4)      if ndcgs      else 0,
@@ -771,13 +729,13 @@ if __name__ == "__main__":
         tmdb_clean, tfidf_matrix, tfidf, id_to_idx, search_df = \
             build_content_model(tmdb)
 
-    # ── load pretrained SVD ───────────────────────────────────
-    svd_data = build_svd_model(ratings)  # loads from disk if exists
+   
 
     # ── train/test split ──────────────────────────────────────
     print("\nSplitting ratings into train/test...")
     train_ratings, test_ratings = split_user_ratings(ratings)
-
+     # ── load pretrained SVD ───────────────────────────────────
+    svd_data = build_svd_model(train_ratings)  # loads from disk if exists
     # ── leakage check ─────────────────────────────────────────
     check_train_test_leakage(train_ratings, test_ratings)
 

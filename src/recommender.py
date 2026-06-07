@@ -136,15 +136,52 @@ def detect_language(title):
     return None
 
 
+def _clean_movielens_title(title):
+    """
+    Convert a MovieLens title to a clean search string for TMDB lookup.
+
+    MovieLens encodes titles like:
+        "Spirited Away (Sen to Chihiro no kamikakushi) (2001)"
+        "Dark Knight, The (2008)"
+        "Matrix, The (1999)"
+
+    We want:
+        "Spirited Away"      ← strip ALL parentheticals, not just year
+        "The Dark Knight"    ← flip trailing article
+        "The Matrix"
+    """
+    # strip every parenthetical — year AND foreign subtitles
+    title = re.sub(r'\s*\([^)]*\)', '', title).strip()
+    # flip trailing article: "Knight, The" → "The Knight"
+    title = re.sub(r',\s*(The|A|An)\s*$', r'\1 ' +
+                   title.split(',')[0].strip(),
+                   title, flags=re.IGNORECASE)
+    # simpler rewrite that actually works:
+    m = re.match(r'^(.*),\s*(The|A|An)\s*$', title, re.IGNORECASE)
+    if m:
+        title = m.group(2) + ' ' + m.group(1)
+    return title.strip()
+
+
+def _normalise_for_match(t):
+    """Strip punctuation, articles, and extra spaces for fuzzy matching."""
+    t = re.sub(r'[^\w\s]', '', t.lower())
+    t = re.sub(r'\b(the|a|an)\b', '', t)
+    return re.sub(r'\s+', ' ', t).strip()
+
+
 def find_best_title_match(title, search_df, threshold=60):
     """
     Returns TMDB movie ID (not title string).
-    Uses search_df which has one row per movie with
-    id, title, release_date, genre_names, title_lower.
 
-    When multiple movies share a title, picks the one
-    with the highest vote_count (most popular / well-known).
-    No user input prompts — fully automatic.
+    Match pipeline:
+      1. Exact match on title_lower
+      2. Normalised match (strip punctuation + articles)
+      3. WRatio fuzzy match at score >= 88
+         WRatio handles substring / transposition cases better than
+         token_sort_ratio, and is safer than partial_ratio which
+         matched "Ed" inside "Spirited Away" at score 100.
+      4. Return None — never returns a wrong match.
     """
     title_lower = title.lower().strip()
 
@@ -153,7 +190,6 @@ def find_best_title_match(title, search_df, threshold=60):
     if len(exact) == 1:
         return int(exact.iloc[0]['id'])
     if len(exact) > 1:
-        # pick most popular among duplicates
         best = exact.loc[exact['vote_count'].idxmax()]
         print(f"  → Multiple exact matches for '{title}', "
               f"picked most popular: '{best['title']}' "
@@ -161,39 +197,33 @@ def find_best_title_match(title, search_df, threshold=60):
         return int(best['id'])
 
     # ── 2. normalised match ───────────────────────────────────
-    def normalise(t):
-        t = re.sub(r'[^\w\s]', '', t.lower())
-        t = re.sub(r'\b(the|a|an)\b', '', t)
-        return re.sub(r'\s+', ' ', t).strip()
-
-    norm_query = normalise(title_lower)
-    search_df  = search_df.copy()
-    search_df['title_norm'] = search_df['title_lower'].apply(normalise)
-    norm_match = search_df[search_df['title_norm'] == norm_query]
+    norm_query  = _normalise_for_match(title_lower)
+    search_copy = search_df.copy()
+    search_copy['title_norm'] = search_copy['title_lower'].apply(
+        _normalise_for_match
+    )
+    norm_match = search_copy[search_copy['title_norm'] == norm_query]
     if len(norm_match) >= 1:
         best = norm_match.loc[norm_match['vote_count'].idxmax()]
         print(f"  → Normalised match: '{best['title']}'")
         return int(best['id'])
 
-    # ── 3. fuzzy token sort — requires strong match ───────────
-    # Threshold raised to 85 (was 60) to prevent short substrings
-    # like "Ed" matching "Spirited Away" via partial_ratio.
-    all_titles  = search_df['title_lower'].tolist()
+    # ── 3. WRatio fuzzy match ─────────────────────────────────
+    # WRatio combines token_set, token_sort, and partial_ratio
+    # internally but applies length penalties that prevent short
+    # strings like "Ed" from matching long titles.
+    # Threshold 88 = strong match required; returns None otherwise.
+    all_titles = search_df['title_lower'].tolist()
     match, score, _ = process.extractOne(
         title_lower, all_titles,
-        scorer=fuzz.token_sort_ratio
+        scorer=fuzz.WRatio
     )
-    if score >= 85:
+    if score >= 88:
         matched_rows = search_df[search_df['title_lower'] == match]
         best = matched_rows.loc[matched_rows['vote_count'].idxmax()]
         print(f"  → Fuzzy matched '{title}' → "
               f"'{best['title']}' (score:{score})")
         return int(best['id'])
-
-    # ── 4. partial ratio — disabled ───────────────────────────
-    # partial_ratio matches any short substring with score 100,
-    # e.g. "Ed" inside "Spirited Away". Too dangerous to use.
-    # If no strong match found, return None rather than a wrong movie.
 
     print(f"  ✗ No match found for '{title}'")
     return None
@@ -373,6 +403,7 @@ def get_content_recommendations(title, tmdb_df, tfidf_matrix,
             seen_titles.add(norm_title)
 
             results.append({
+                'tmdb_id':           int(row['id']),
                 'title':             row['title'],
                 'genre_names':       genres,
                 'similarity_score':  round(score, 4),
@@ -830,9 +861,6 @@ def hybrid_recommend(user_id, user_movie_matrix, ratings_df,
                      alpha=0.4, beta=0.3, gamma=0.3, n=10):
     print(f"\nGenerating hybrid recommendations for user {user_id}...")
 
-    # use clustered CF if available, else item-based CF
-    # use clustered CF if available — load once, reuse
-    # _cluster_cache avoids reloading pkl on every call
     if not hasattr(hybrid_recommend, '_cluster_cache'):
         hybrid_recommend._cluster_cache = \
             build_clustered_collab_model(ratings_df)
@@ -847,7 +875,8 @@ def hybrid_recommend(user_id, user_movie_matrix, ratings_df,
         collab_recs = get_collab_recommendations(
             user_id, user_movie_matrix, ratings_df, n=50
         )
-    svd_recs    = get_svd_recommendations(
+        
+    svd_recs = get_svd_recommendations(
         user_id, svd_data, ratings_df, movies_df, n=50)
 
     user_top = (
@@ -862,13 +891,11 @@ def hybrid_recommend(user_id, user_movie_matrix, ratings_df,
         if len(title_row) == 0:
             continue
         title = title_row.values[0]
-        title = re.sub(r'\s*\(\d{4}\)\s*$', '', title).strip()
-        if ', The' in title:
-            title = 'The ' + title.replace(', The', '')
-        if ', A ' in title:
-            title = 'A ' + title.replace(', A ', ' ')
+        # Use your global robust cleaning function instead of inline regexes
+        cleaned_title = _clean_movielens_title(title)
+        
         recs = get_content_recommendations(
-            title, tmdb_df, tfidf_matrix,
+            cleaned_title, tmdb_df, tfidf_matrix,
             id_to_idx, search_df, n=20
         )
         content_recs.extend(recs)
@@ -877,80 +904,78 @@ def hybrid_recommend(user_id, user_movie_matrix, ratings_df,
     svd_recs     = normalize_scores(svd_recs,      'predicted_rating')
     content_recs = normalize_scores(content_recs,  'similarity_score')
 
-    # ── normalised title index for content recs ────────────────
-    # TMDB titles ("The Dark Knight") differ from MovieLens titles
-    # ("Dark Knight, The (2008)"). Normalise both sides so lookups
-    # don't silently drop every content recommendation.
-    def _norm(t):
-        t = str(t)
-        t = re.sub(r'\s*\(\d{4}\)\s*$', '', t)                      # strip year
-        t = re.sub(r',\s*(The|A|An)\s*$', '', t, flags=re.IGNORECASE)  # trailing article
-        t = re.sub(r'^(The|A|An)\s+', '', t, flags=re.IGNORECASE)       # leading article
-        return t.strip().lower()
+    # Global normalization utility targeting both frameworks 
+    def _global_norm(t):
+        t = str(t).lower().strip()
+        t = re.sub(r'\s*\(\d{4}\)\s*$', '', t)
+        t = re.sub(r'[^\w\s]', '', t)
+        return t.strip()
 
     movies_norm = {
-        _norm(t): int(mid)
+        _global_norm(_clean_movielens_title(t)): int(mid)
         for t, mid in zip(movies_df['title'], movies_df['movieId'])
     }
 
-    combined = {}  # movieId -> score
+    tmdb_to_ml = {}
+    for _, row in tmdb_df.iterrows():
+        norm_tmdb_title = _global_norm(str(row['title']))
+        mid = movies_norm.get(norm_tmdb_title)
+        if mid is not None:
+            tmdb_to_ml[int(row['id'])] = int(mid)
 
-    # ── collab: movieId already present ───────────────────────
+    combined = {}  # movieId (int) -> score
+
+    # ── 1. Collaborative Filtering Contributions ──
     for r in collab_recs:
-        mid = r['movieId']
-        combined[mid] = (
-            combined.get(mid, 0) + alpha * r['normalized_score']
-        )
+        mid = int(r['movieId'])
+        combined[mid] = combined.get(mid, 0.0) + alpha * r.get('normalized_score', 0.0)
 
-    # ── SVD: movieId already present — no title lookup needed ─
-    # get_svd_recommendations returns {'movieId': ..., 'title': ..., ...}
+    # ── 2. Matrix Factorization (SVD) Contributions ──
     for r in svd_recs:
-        mid = r['movieId']
-        combined[mid] = (
-            combined.get(mid, 0) + gamma * r['normalized_score']
-        )
+        mid = int(r['movieId'])
+        combined[mid] = combined.get(mid, 0.0) + gamma * r.get('normalized_score', 0.0)
 
-    # ── content: TMDB titles → normalised movieId lookup ──────
+    # ── 3. Content Filtering Contributions ──
     for r in content_recs:
-        mid = movies_norm.get(_norm(r['title']))
+        mid = tmdb_to_ml.get(r.get('tmdb_id')) 
+        if mid is None:
+            mid = movies_norm.get(_global_norm(r['title']))
         if mid is None:
             continue
-        combined[mid] = (
-            combined.get(mid, 0) + beta * r['normalized_score']
-        )
+            
+        mid = int(mid)
+        combined[mid] = combined.get(mid, 0.0) + beta * r.get('normalized_score', 0.0)
 
-    # ── remove already-seen movies ────────────────────────────
-    seen_ids = set(
-        ratings_df[ratings_df['userId'] == user_id]['movieId']
-    )
+    # ── Filter out user history ──
+    seen_ids = set(int(x) for x in ratings_df[ratings_df['userId'] == user_id]['movieId'])
     for mid in seen_ids:
         combined.pop(mid, None)
 
-    # ── build id->title lookup once ───────────────────────────
-    movie_lookup = (
-        movies_df.set_index('movieId')['title'].to_dict()
-    )
+    movie_lookup = movies_df.set_index('movieId')['title'].to_dict()
+    # Mild inverse popularity penalty to reduce popularity bias
+    movie_popularity = (
+       ratings_df['movieId'].value_counts().to_dict()
+)
+    max_pop = max(movie_popularity.values()) if movie_popularity else 1
+    for mid in list(combined.keys()):
+      pop = movie_popularity.get(mid, 0)
+      pop_penalty = 0.15 * (pop / max_pop)   # penalise up to 15%
+      combined[mid] = max(0.0, combined[mid] - pop_penalty)
+      ranked = sorted(combined.items(), key=lambda x: x[1], reverse=True)
 
-    ranked = sorted(
-        combined.items(), key=lambda x: x[1], reverse=True
-    )
-
-    # contribution summary for monitoring
-    print(f"  contributions → collab:{sum(1 for r in collab_recs if r['normalized_score']>0)}"
-          f"  svd:{sum(1 for r in svd_recs if r['normalized_score']>0)}"
-          f"  content:{sum(1 for r in content_recs if r['normalized_score']>0)}"
+    print(f"  contributions → collab:{len(collab_recs)}"
+          f"  svd:{len(svd_recs)}"
+          f"  content:{len(content_recs)}"
           f"  pool:{len(combined)}")
 
     return [
         {
             'movieId':      int(mid),
-            'title':        movie_lookup.get(mid, ''),
-            'hybrid_score': round(score, 4)
+            'title':        movie_lookup.get(mid, 'Unknown Title'),
+            'hybrid_score': round(float(score), 4)
         }
         for mid, score in ranked[:n]
     ]
-
-
 # ══════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════
