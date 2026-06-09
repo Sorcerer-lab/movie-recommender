@@ -19,9 +19,9 @@ from src.recommender import (
 )
 
 
-# ══════════════════════════════════════════════════════════════
+
 # METRIC FUNCTIONS
-# ══════════════════════════════════════════════════════════════
+
 
 def precision_at_k(recommended, relevant, k=10):
     hits = sum(1 for r in recommended[:k] if r in relevant)
@@ -140,9 +140,9 @@ def diversity_score(recs, tmdb_df, _norm_idx=None):
     return round(1 - float(np.mean(similarities)), 4)
 
 
-# ══════════════════════════════════════════════════════════════
+
 # TRAIN / TEST SPLIT
-# ══════════════════════════════════════════════════════════════
+
 
 def split_user_ratings(ratings_df, test_ratio=0.2,
                         min_ratings=20):
@@ -173,9 +173,9 @@ def split_user_ratings(ratings_df, test_ratio=0.2,
     return train, test
 
 
-# ══════════════════════════════════════════════════════════════
+
 # EVALUATE CLUSTERED COLLAB ONLY
-# ══════════════════════════════════════════════════════════════
+
 
 def evaluate_clustered_collab(train_ratings, test_ratings,
                                movies_df, n_users=50, k=10):
@@ -260,9 +260,9 @@ def evaluate_clustered_collab(train_ratings, test_ratings,
     }
 
 
-# ══════════════════════════════════════════════════════════════
-# EVALUATE FULL HYBRID SYSTEM — what users actually experience
-# ══════════════════════════════════════════════════════════════
+
+# EVALUATE FULL HYBRID SYSTEM 
+
 
 def evaluate_hybrid(train_ratings, test_ratings,
                     movies_df, tmdb_df, tfidf_matrix,
@@ -303,7 +303,7 @@ def evaluate_hybrid(train_ratings, test_ratings,
 
     tmdb_norm_idx = _build_tmdb_norm_index(tmdb_df)
     mid_to_title = movies_df.set_index('movieId')['title'].to_dict()
-    # Clear stale cache so it rebuilds from train_ratings only
+    
     if hasattr(hybrid_recommend, '_cluster_cache'):
        del hybrid_recommend._cluster_cache
     for user_id in test_users:
@@ -381,9 +381,9 @@ def evaluate_hybrid(train_ratings, test_ratings,
         'Coverage':                round(coverage, 4),
         'Users evaluated':         len(precisions)
     }
-# ══════════════════════════════════════════════════════════════
+
 # CONTENT EVALUATION
-# ══════════════════════════════════════════════════════════════
+
 
 def evaluate_content(tmdb_df, tfidf_matrix,
                      id_to_idx, search_df, k=10):
@@ -432,9 +432,8 @@ def evaluate_content(tmdb_df, tfidf_matrix,
     }
 
 
-# ══════════════════════════════════════════════════════════════
+
 # SENTIMENT EVALUATION
-# ══════════════════════════════════════════════════════════════
 
 def evaluate_sentiment(imdb_df, n_samples=300):
     print(f"\nEvaluating Sentiment (n={n_samples})...")
@@ -499,9 +498,9 @@ def evaluate_sentiment(imdb_df, n_samples=300):
 
 
 
-# ══════════════════════════════════════════════════════════════
+
 # SANITY BASELINE — random recommender
-# ══════════════════════════════════════════════════════════════
+
 
 def random_recommend(movies_df, k=10):
     return list(np.random.choice(movies_df['movieId'], k, replace=False))
@@ -546,9 +545,9 @@ def evaluate_random_baseline(test_ratings, movies_df, n_users=50, k=10):
     }
 
 
-# ══════════════════════════════════════════════════════════════
+
 # LEAKAGE CHECK
-# ══════════════════════════════════════════════════════════════
+
 
 def check_train_test_leakage(train_ratings, test_ratings):
     """
@@ -575,9 +574,9 @@ def print_report(title, results):
         print(f"  {k:<30} {v}")
 
 
-# ══════════════════════════════════════════════════════════════
+
 # MAIN
-# ══════════════════════════════════════════════════════════════
+
 
 if __name__ == "__main__":
     print("=" * 55)
@@ -586,7 +585,7 @@ if __name__ == "__main__":
 
     import scipy.sparse
 
-    # ── load data ─────────────────────────────────────────────
+    #  load data
     ratings = load_ratings(sample=True)
     movies  = load_movies()
 
@@ -594,7 +593,7 @@ if __name__ == "__main__":
     imdb = load_imdb()
     imdb['label'] = (imdb['sentiment'] == 'positive').astype(int)
 
-    # ── load pretrained TF-IDF if available ───────────────────
+    #  load pretrained TF-IDF if available 
     tmdb_pkl = Path("models/tmdb_clean.pkl")
     if tmdb_pkl.exists():
         print("\nLoading pre-trained TF-IDF from disk...")
@@ -623,42 +622,42 @@ if __name__ == "__main__":
 
    
 
-    # ── train/test split ──────────────────────────────────────
+    #  train/test split 
     print("\nSplitting ratings into train/test...")
     train_ratings, test_ratings = split_user_ratings(ratings)
-     # ── load pretrained SVD ───────────────────────────────────
+     #  load pretrained SVD
     svd_data = build_svd_model(train_ratings)  # loads from disk if exists
-    # ── leakage check ─────────────────────────────────────────
+    #  leakage check 
     check_train_test_leakage(train_ratings, test_ratings)
 
-    # ── build collab matrix on TRAIN data ─────────────────────
+    #  build collab matrix on TRAIN data 
     user_movie_matrix, _ = build_collab_model(train_ratings)
 
-    # ── build cluster model on TRAIN data ─────────────────────
+    #  build cluster model on TRAIN data 
     cluster_data = build_clustered_collab_model(train_ratings)
     print(f"  Cluster coverage of test users: "
           f"{sum(1 for u in test_ratings['userId'].unique() if u in cluster_data['user_cluster'])} "
           f"/ {test_ratings['userId'].nunique()}")
 
-    # ── 1. clustered CF evaluation ────────────────────────────
+    # 1. clustered CF evaluation 
     collab_results = evaluate_clustered_collab(
         train_ratings, test_ratings, movies,
         n_users=50, k=10
     )
     print_report("CLUSTERED COLLABORATIVE FILTERING", collab_results)
 
-    # ── 2. content evaluation ─────────────────────────────────
+    #2. content evaluation
     content_results = evaluate_content(
         tmdb_clean, tfidf_matrix,
         id_to_idx, search_df, k=10
     )
     print_report("CONTENT-BASED FILTERING", content_results)
 
-    # ── 3. sentiment evaluation ───────────────────────────────
+    #  3. sentiment evaluation
     sentiment_results = evaluate_sentiment(imdb, n_samples=300)
     print_report("SENTIMENT MODELS", sentiment_results)
 
-    # ── 4. full hybrid evaluation ─────────────────────────────
+    #  4. full hybrid evaluation 
     hybrid_results = evaluate_hybrid(
         train_ratings, test_ratings,
         movies, tmdb_clean, tfidf_matrix,
@@ -668,13 +667,13 @@ if __name__ == "__main__":
     )
     print_report("FULL HYBRID SYSTEM", hybrid_results)
 
-    # ── 5. random baseline ────────────────────────────────────
+    # 5. random baseline 
     random_results = evaluate_random_baseline(
         test_ratings, movies, n_users=50, k=10
     )
     print_report("RANDOM BASELINE", random_results)
 
-    # ── 6. final summary ──────────────────────────────────────
+    #6. final summary 
     print("\n" + "="*55)
     print("  FINAL SUMMARY")
     print("="*55)

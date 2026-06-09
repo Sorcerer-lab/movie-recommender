@@ -4,10 +4,10 @@ import re
 from pathlib import Path
 import math
 
-# ── VADER ─────────────────────────────────────────────────────
+# VADER
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-# ── paths ──────────────────────────────────────────────────────
+# paths 
 DATA_RAW  = Path("data/raw")
 MODEL_DIR = Path("models/distilbert_sentiment")
 
@@ -18,9 +18,9 @@ _VAL_END   = 6000   # indices [5000, 6000) are validation
 # evaluate.py samples from indices [6000, …) — never seen during training
 
 
-# ══════════════════════════════════════════════════════════════
+
 # UTILITIES
-# ══════════════════════════════════════════════════════════════
+
 
 def clean_review(text):
     text = re.sub(r'<[^>]+>', ' ', text)
@@ -58,9 +58,9 @@ def get_imdb_splits(df):
     return train_df, val_df, eval_df
 
 
-# ══════════════════════════════════════════════════════════════
+
 # 1. VADER
-# ══════════════════════════════════════════════════════════════
+
 
 def build_vader():
     analyzer = SentimentIntensityAnalyzer()
@@ -90,9 +90,9 @@ def evaluate_vader(df, analyzer, sample=500):
     return accuracy
 
 
-# ══════════════════════════════════════════════════════════════
+
 # 2. RE-RANKER
-# ══════════════════════════════════════════════════════════════
+
 
 def rerank_with_sentiment(hybrid_recs, analyzer,
                            tmdb_df=None,
@@ -163,9 +163,9 @@ def rerank_with_sentiment(hybrid_recs, analyzer,
     return results
 
 
-# ══════════════════════════════════════════════════════════════
+
 # 3. DISTILBERT
-# ══════════════════════════════════════════════════════════════
+
 import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import (DistilBertTokenizerFast,
@@ -339,10 +339,9 @@ def evaluate_distilbert(df, model, tokenizer, sample=200):
     print(f"✓ DistilBERT accuracy on {len(sample_df)} held-out reviews: {accuracy:.1%}")
     return accuracy
 
-
-# ══════════════════════════════════════════════════════════════
+ 
 # MAIN
-# ══════════════════════════════════════════════════════════════
+
 
 if __name__ == "__main__":
     print("=" * 55)

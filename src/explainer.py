@@ -7,9 +7,9 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent))
 
 
-# ══════════════════════════════════════════════════════════════
+
 # 1. RULE-BASED EXPLAINER
-# ══════════════════════════════════════════════════════════════
+
 
 def extract_year(title):
     """Extract year from MovieLens title format 'Movie Name (1999)'."""
@@ -172,9 +172,9 @@ def explain_recommendations(recs, ratings_df, movies_df, user_id):
     return explained
 
 
-# ══════════════════════════════════════════════════════════════
+
 # 2. LIME EXPLAINER — why did sentiment score this way?
-# ══════════════════════════════════════════════════════════════
+
 
 def explain_sentiment_with_lime(review_text, model, tokenizer,
                                  n_words=8):
@@ -217,7 +217,7 @@ def explain_sentiment_with_lime(review_text, model, tokenizer,
             num_samples=100    # lower = faster, higher = more accurate
         )
 
-        # get word → importance score pairs
+        # get word- importance score pairs
         word_scores = exp.as_list()
         return word_scores
 
@@ -239,9 +239,9 @@ def format_lime_explanation(word_scores):
     return ' | '.join(parts) if parts else "No clear signals found"
 
 
-# ══════════════════════════════════════════════════════════════
+
 # MAIN — test explainer
-# ══════════════════════════════════════════════════════════════
+
 
 if __name__ == "__main__":
     from src.recommender import load_ratings, load_movies

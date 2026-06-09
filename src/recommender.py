@@ -14,9 +14,9 @@ from rapidfuzz import process, fuzz
 DATA_RAW = Path("data/raw")
 
 
-# ══════════════════════════════════════════════════════════════
+
 # 1. DATA LOADERS
-# ══════════════════════════════════════════════════════════════
+
 
 def load_ratings(sample=True):
     for name in ["ratings.csv", "rating.csv"]:
@@ -126,9 +126,9 @@ def load_imdb():
     return df
 
 
-# ══════════════════════════════════════════════════════════════
+
 # 2. TITLE MATCHING — ID based, no duplicate issues
-# ══════════════════════════════════════════════════════════════
+
 
 def detect_language(title):
     if any(ord(c) > 127 for c in title):
@@ -185,7 +185,7 @@ def find_best_title_match(title, search_df, threshold=60):
     """
     title_lower = title.lower().strip()
 
-    # ── 1. exact match ────────────────────────────────────────
+    # 1. exact match 
     exact = search_df[search_df['title_lower'] == title_lower]
     if len(exact) == 1:
         return int(exact.iloc[0]['id'])
@@ -196,7 +196,7 @@ def find_best_title_match(title, search_df, threshold=60):
               f"({str(best['release_date'])[:4]})")
         return int(best['id'])
 
-    # ── 2. normalised match ───────────────────────────────────
+    #  2. normalised match
     norm_query  = _normalise_for_match(title_lower)
     search_copy = search_df.copy()
     search_copy['title_norm'] = search_copy['title_lower'].apply(
@@ -208,7 +208,7 @@ def find_best_title_match(title, search_df, threshold=60):
         print(f"  → Normalised match: '{best['title']}'")
         return int(best['id'])
 
-    # ── 3. WRatio fuzzy match ─────────────────────────────────
+    # 3. WRatio fuzzy match 
     # WRatio combines token_set, token_sort, and partial_ratio
     # internally but applies length penalties that prevent short
     # strings like "Ed" from matching long titles.
@@ -229,9 +229,8 @@ def find_best_title_match(title, search_df, threshold=60):
     return None
 
 
-# ══════════════════════════════════════════════════════════════
 # 3. CONTENT-BASED FILTERING (TF-IDF)
-# ══════════════════════════════════════════════════════════════
+
 
 def build_content_model(tmdb_df):
     """
@@ -265,7 +264,7 @@ def build_content_model(tmdb_df):
               f"({tmdb_clean.shape[0]} movies)")
         return tmdb_clean, tfidf_matrix, tfidf, id_to_idx, search_df
 
-    # ── no pretrained model — build from scratch ──────────────
+    # no pretrained model — build from scratch 
     print("Building TF-IDF from scratch...")
 
     df = tmdb_df.copy().reset_index(drop=True)
@@ -416,9 +415,9 @@ def get_content_recommendations(title, tmdb_df, tfidf_matrix,
     return results
 
 
-# ══════════════════════════════════════════════════════════════
+
 # 4. COLLABORATIVE FILTERING
-# ══════════════════════════════════════════════════════════════
+
 
 def build_collab_model(ratings_df,
                        min_movie_ratings=50,
@@ -650,9 +649,9 @@ def get_collab_recommendations(user_id, user_movie_matrix,
             for mid, score in top_movies]
 
 
-# ══════════════════════════════════════════════════════════════
+
 # 5. SVD MATRIX FACTORIZATION
-# ══════════════════════════════════════════════════════════════
+
 
 def build_svd_model(ratings_df, n_factors=100):
     """
@@ -688,7 +687,7 @@ def build_svd_model(ratings_df, n_factors=100):
     print("\nBuilding SVD on full dataset (sparse, no dense matrix)...")
     print(f"  Ratings: {len(ratings_df):,}")
 
-    # ── 1. build integer indices for users and movies ──────────
+    #  1. build integer indices for users and movies 
     user_ids  = sorted(ratings_df['userId'].unique())
     movie_ids = sorted(ratings_df['movieId'].unique())
     user_idx  = {u: i for i, u in enumerate(user_ids)}
@@ -698,7 +697,7 @@ def build_svd_model(ratings_df, n_factors=100):
     n_movies = len(movie_ids)
     print(f"  Users: {n_users:,}  Movies: {n_movies:,}")
 
-    # ── 2. mean-centre each user's ratings ────────────────────
+    #  2. mean-centre each user's ratings 
     # compute per-user mean from raw ratings — no matrix needed
     user_mean_series = (
         ratings_df.groupby('userId')['rating'].mean()
@@ -708,7 +707,7 @@ def build_svd_model(ratings_df, n_factors=100):
         dtype=np.float32
     )
 
-    # ── 3. build sparse CSR matrix (centred) ──────────────────
+    # 3. build sparse CSR matrix (centred) 
     print("  Building sparse CSR matrix...")
     rows    = ratings_df['userId'].map(user_idx).values
     cols    = ratings_df['movieId'].map(movie_idx).values
@@ -723,7 +722,7 @@ def build_svd_model(ratings_df, n_factors=100):
     print(f"  Sparse matrix: {sparse_mat.shape}  "
           f"nnz={sparse_mat.nnz:,}")
 
-    # ── 4. run sparse SVD ─────────────────────────────────────
+    #  4. run sparse SVD 
     k = min(n_factors, min(n_users, n_movies) - 1)
     print(f"  Running svds(k={k}) — this takes ~5–15 min on CPU, "
           f"~1–2 min on Colab T4...")
@@ -738,7 +737,7 @@ def build_svd_model(ratings_df, n_factors=100):
 
     print(f"  Top 5 singular values: {sigma[:5].round(1)}")
 
-    # ── 5. save decomposition only — no predicted_matrix ──────
+    #  5. save decomposition only — no predicted_matrix 
     svd_data = {
         'U':          U.astype(np.float32),      # (n_users,  k)
         'sigma':      sigma.astype(np.float32),  # (k,)
@@ -785,7 +784,7 @@ def get_svd_recommendations(user_id, svd_data, ratings_df,
     )
 
     if user_id in user_idx:
-        # ── known user: retrieve stored U row ─────────────────
+        # known user: retrieve stored U row 
         i        = user_idx[user_id]
         u_mean   = float(user_means[i])
         # predicted = (U[i] * sigma) @ Vt  +  user_mean
@@ -793,7 +792,7 @@ def get_svd_recommendations(user_id, svd_data, ratings_df,
         preds    = u_vec @ Vt + u_mean      # (n_movies,)
 
     else:
-        # ── unknown user: project from their ratings ───────────
+        # unknown user: project from their ratings 
         user_ratings = (
             ratings_df[ratings_df['userId'] == user_id]
             .set_index('movieId')['rating']
@@ -816,7 +815,7 @@ def get_svd_recommendations(user_id, svd_data, ratings_df,
 
     preds = np.clip(preds, 0.5, 5.0)
 
-    # ── rank unseen movies ─────────────────────────────────────
+    #  rank unseen movies 
     candidates = [
         (movie_ids[i], float(preds[i]))
         for i in range(len(movie_ids))
@@ -824,7 +823,7 @@ def get_svd_recommendations(user_id, svd_data, ratings_df,
     ]
     candidates.sort(key=lambda x: x[1], reverse=True)
 
-    # ── build result list ──────────────────────────────────────
+    # build result list 
     mid_to_title = (
         movies_df.set_index('movieId')['title'].to_dict()
     )
@@ -838,9 +837,9 @@ def get_svd_recommendations(user_id, svd_data, ratings_df,
     ]
 
 
-# ══════════════════════════════════════════════════════════════
+
 # 6. WEIGHTED ENSEMBLE
-# ══════════════════════════════════════════════════════════════
+
 
 def normalize_scores(recs, score_key):
     if not recs:
@@ -925,17 +924,17 @@ def hybrid_recommend(user_id, user_movie_matrix, ratings_df,
 
     combined = {}  # movieId (int) -> score
 
-    # ── 1. Collaborative Filtering Contributions ──
+    #  1. Collaborative Filtering Contributions 
     for r in collab_recs:
         mid = int(r['movieId'])
         combined[mid] = combined.get(mid, 0.0) + alpha * r.get('normalized_score', 0.0)
 
-    # ── 2. Matrix Factorization (SVD) Contributions ──
+    #  2. Matrix Factorization (SVD) Contributions 
     for r in svd_recs:
         mid = int(r['movieId'])
         combined[mid] = combined.get(mid, 0.0) + gamma * r.get('normalized_score', 0.0)
 
-    # ── 3. Content Filtering Contributions ──
+    # 3. Content Filtering Contributions 
     for r in content_recs:
         mid = tmdb_to_ml.get(r.get('tmdb_id')) 
         if mid is None:
@@ -946,7 +945,7 @@ def hybrid_recommend(user_id, user_movie_matrix, ratings_df,
         mid = int(mid)
         combined[mid] = combined.get(mid, 0.0) + beta * r.get('normalized_score', 0.0)
 
-    # ── Filter out user history ──
+    #  Filter out user history
     seen_ids = set(int(x) for x in ratings_df[ratings_df['userId'] == user_id]['movieId'])
     for mid in seen_ids:
         combined.pop(mid, None)
@@ -976,9 +975,9 @@ def hybrid_recommend(user_id, user_movie_matrix, ratings_df,
         }
         for mid, score in ranked[:n]
     ]
-# ══════════════════════════════════════════════════════════════
+
 # MAIN
-# ══════════════════════════════════════════════════════════════
+
 
 if __name__ == "__main__":
     ratings = load_ratings(sample=True)

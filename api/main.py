@@ -125,9 +125,9 @@ print(f"✓ Final score = {HYBRID_W}×hybrid + {TMDB_W}×tmdb + {DISTILBERT_W}×
 print("✓ All models ready — API is live!")
 
 
-# ══════════════════════════════════════════════════════════════
+
 # ENDPOINTS
-# ══════════════════════════════════════════════════════════════
+
 
 @app.get("/")
 def root():
